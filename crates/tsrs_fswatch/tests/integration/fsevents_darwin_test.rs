@@ -320,3 +320,63 @@ fn write_settling_counts_the_files_a_rename_batch_left() {
     watch.destroy_debounce_for_test();
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[test]
+fn event_paths_are_delivered_in_nfc() {
+    let base = std::env::temp_dir().join(format!("tsrs-fswatch-nfc-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let root = &std::fs::canonicalize(&base).unwrap().to_str().unwrap().to_string();
+    let db = Debounce::new_without_loop_for_test();
+    let watch =
+        DirWatch::new(root.clone(), root.clone(), &db, BytePathComparer::default(), None, true);
+    let delivered = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = Arc::clone(&delivered);
+    watch.add_callback(
+        root,
+        root,
+        true,
+        Arc::new(move |events, _| {
+            seen.lock().unwrap().extend(events.into_iter().map(|e| e.path));
+        }),
+        None,
+        "",
+    );
+    let cb = tsrs_fswatch::fsevents_darwin_ffi::new_stream_callback(&[
+        tsrs_fswatch::fsevents_darwin::FseventsWatchSnapshot {
+            w: Arc::clone(&watch),
+            state: Arc::new(tsrs_fswatch::fsevents_darwin::FseventsState::default()),
+        },
+    ])
+    .unwrap();
+    let long = "a/".repeat(700) + "z.ts";
+    let ascii: String = (0x20u8..0x7f).filter(|&b| b != b'/').map(char::from).collect();
+    // (reported, delivered)
+    let names = [
+        ("plain.ts", "plain.ts"),
+        (ascii.as_str(), ascii.as_str()),
+        ("\u{7f}\u{1}.ts", "\u{7f}\u{1}.ts"),
+        (long.as_str(), long.as_str()),
+        ("e\u{301}.ts", "\u{e9}.ts"),
+        ("\u{e9}.ts", "\u{e9}.ts"),
+        ("\u{212b}.ts", "\u{c5}.ts"),
+        ("\u{1100}\u{1161}.ts", "\u{ac00}.ts"),
+        ("\u{1f600}.ts", "\u{1f600}.ts"),
+        ("a\u{323}\u{307}.ts", "\u{1ea1}\u{307}.ts"),
+    ];
+    let flags = tsrs_fswatch::fsevents_darwin::FLAG_ITEM_CREATED
+        | tsrs_fswatch::fsevents_darwin::FLAG_ITEM_IS_DIR;
+    let paths: Vec<String> = names.iter().map(|(name, _)| format!("{root}/{name}")).collect();
+    let events: Vec<(&str, u32)> = paths.iter().map(|path| (path.as_str(), flags)).collect();
+    tsrs_fswatch::fsevents_darwin_ffi::dispatch_test_events(&cb, &events);
+    watch.trigger_callbacks_for_test();
+    let mut got = delivered.lock().unwrap().clone();
+    got.sort();
+    let mut want: Vec<String> = names.iter().map(|(_, nfc)| format!("{root}/{nfc}")).collect();
+    want.sort();
+    // An event list keeps one entry per path.
+    want.dedup();
+    assert_eq!(got, want);
+    watch.destroy_debounce_for_test();
+    let _ = std::fs::remove_dir_all(&base);
+}
