@@ -122,6 +122,7 @@ fn tree() -> Tree {
         "node_modules/.pnpm/pkg@1/node_modules/pkg",
         "node_modules/.pnpm/dep@2/node_modules/dep",
         "node_modules/@scope",
+        "node_modules/plain/lib",
         "\u{fc}",
     ] {
         std::fs::create_dir_all(format!("{root}/{dir}")).unwrap();
@@ -132,6 +133,7 @@ fn tree() -> Tree {
         "real/deep/a/b/c/d.ts",
         "node_modules/.pnpm/pkg@1/node_modules/pkg/index.d.ts",
         "node_modules/.pnpm/dep@2/node_modules/dep/index.d.ts",
+        "node_modules/plain/lib/index.d.ts",
         "\u{fc}/\u{f1}.ts",
     ] {
         std::fs::write(format!("{root}/{file}"), "").unwrap();
@@ -190,6 +192,7 @@ fn cases(t: &Tree) -> Vec<(String, String)> {
                 "node_modules/.pnpm/pkg@1/node_modules/dep/index.d.ts",
                 "node_modules/.pnpm/dep@2/node_modules/dep/index.d.ts",
             ),
+            to("node_modules/plain/lib/index.d.ts", "node_modules/plain/lib/index.d.ts"),
             to("\u{fc}/\u{f1}.ts", "\u{fc}/\u{f1}.ts"),
             to("/real/./sub//g.ts", "real/sub/g.ts"),
             // ".." is lexical over real directories and physical after a link (EvalSymlinks).

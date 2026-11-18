@@ -270,8 +270,10 @@ enum Lstat {
     Other,
 }
 
+// The walk's lstat of `path`. With a memo and `rest` (the input after `path`, while the walk has followed no link),
+// a miss may settle `path` and every component of `rest` in one call.
 #[cfg(not(any(target_os = "linux", windows)))]
-fn lstat(path: &str, memo: Option<&RealpathMemo>) -> io::Result<Lstat> {
+fn lstat(path: &str, rest: Option<&str>, memo: Option<&RealpathMemo>) -> io::Result<Lstat> {
     let os = || {
         let file_type = fs::symlink_metadata(path)?.file_type();
         Ok(if file_type.is_symlink() {
@@ -288,9 +290,74 @@ fn lstat(path: &str, memo: Option<&RealpathMemo>) -> io::Result<Lstat> {
     if let Some(known) = memo.lstat.load(path) {
         return known.map_err(io::Error::from);
     }
+    if let Some(settled) = rest.and_then(|rest| stat_without_symlinks(memo, path, rest)) {
+        return settled;
+    }
     let result = os();
     memo.lstat.store(path.to_string(), result.as_ref().copied().map_err(io::Error::kind));
     result
+}
+
+// fstatat with AT_SYMLINK_NOFOLLOW_ANY fails with ELOOP at the first link on the path and otherwise reports what lstat
+// of the whole path does, ENOENT and ENOTDIR included, which the walk meets the same way before any link. One call
+// then answers the walk's lstat of every remaining component. It is skipped with one component left, and where a
+// package directory remains (node_modules/<name>, node_modules/@scope/<name>: links under pnpm and workspaces), as
+// it would mostly meet a link there and add a call.
+#[cfg(target_os = "macos")]
+fn stat_without_symlinks(memo: &RealpathMemo, dir: &str, rest: &str) -> Option<io::Result<Lstat>> {
+    use rustix::fs::{AtFlags, CWD, FileType, statat};
+    use rustix::io::Errno;
+
+    const AT_SYMLINK_NOFOLLOW_ANY: u32 = 0x0800;
+    let names = rest.strip_prefix('/')?;
+    if names.split('/').any(|name| matches!(name, "" | "." | "..")) || names_package_dir(dir, names)
+    {
+        return None;
+    }
+    let path = format!("{dir}{rest}");
+    let stat = match statat(CWD, path.as_str(), AtFlags::from_bits_retain(AT_SYMLINK_NOFOLLOW_ANY))
+    {
+        Ok(stat) => stat,
+        Err(err @ (Errno::NOENT | Errno::NOTDIR)) => return Some(Err(err.into())),
+        Err(_) => return None,
+    };
+    for (end, _) in rest.match_indices('/') {
+        memo.lstat.store(path[..dir.len() + end].to_string(), Ok(Lstat::Dir));
+    }
+    let file_type = FileType::from_raw_mode(stat.st_mode);
+    let leaf = if file_type.is_symlink() {
+        Lstat::Symlink
+    } else if file_type.is_dir() {
+        Lstat::Dir
+    } else {
+        Lstat::Other
+    };
+    memo.lstat.store(path, Ok(leaf));
+    Some(Ok(Lstat::Dir))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+const fn stat_without_symlinks(_: &RealpathMemo, _: &str, _: &str) -> Option<io::Result<Lstat>> {
+    None
+}
+
+// Whether `dir`'s last component or one of `names` is node_modules/<name> or node_modules/@scope/<name>.
+#[cfg(target_os = "macos")]
+fn names_package_dir(dir: &str, names: &str) -> bool {
+    let mut before = dir.rsplit('/');
+    let current = before.next().unwrap_or_default();
+    let mut prev = before.next().unwrap_or_default();
+    let mut prev2 = before.next().unwrap_or_default();
+    for name in std::iter::once(current).chain(names.split('/')) {
+        if (prev == "node_modules" && !name.starts_with('@'))
+            || (prev2 == "node_modules" && prev.starts_with('@'))
+        {
+            return true;
+        }
+        prev2 = prev;
+        prev = name;
+    }
+    false
 }
 
 #[cfg(not(any(target_os = "linux", windows)))]
@@ -375,7 +442,7 @@ fn walk_symlinks(path: &str, memo: Option<&RealpathMemo>) -> io::Result<String> 
         dest.push_str(&path[start..end]);
 
         // Resolve symlink.
-        let fi = lstat(&dest, memo)?;
+        let fi = lstat(&dest, (links_walked == 0).then(|| &path[end..]), memo)?;
 
         if fi != Lstat::Symlink {
             if fi != Lstat::Dir && end < path.len() {
