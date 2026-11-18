@@ -3028,20 +3028,23 @@ impl Program {
         root_directory: &str,
     ) -> bool {
         let mut all_files_belong_to_path = true;
+        // program.go:1857 compares with the host's case sensitivity, not the zero-valued `compare_paths_options`.
+        let compare_paths_options = ComparePathsOptions {
+            use_case_sensitive_file_names: self.use_case_sensitive_file_names(),
+            current_directory: String::new(),
+        };
         // The path comparisons are independent (vscode: 10k files, ~1 us each); the diagnostics stay in file order.
         let outside: Vec<bool> = if self.single_threaded() {
             source_files
                 .iter()
-                .map(|file| {
-                    !tspath::contains_path(root_directory, file, &self.compare_paths_options)
-                })
+                .map(|file| !tspath::contains_path(root_directory, file, &compare_paths_options))
                 .collect()
         } else {
             worker_pool().install(|| {
                 source_files
                     .par_iter()
                     .map(|file| {
-                        !tspath::contains_path(root_directory, file, &self.compare_paths_options)
+                        !tspath::contains_path(root_directory, file, &compare_paths_options)
                     })
                     .collect()
             })

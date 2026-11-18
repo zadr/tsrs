@@ -1,7 +1,7 @@
-// Include diagnostics that depend on the host's case sensitivity, which the CLI takes from the volume of its
-// executable and these tests from vfstest's flag. The expected text is tsgo 7.1.0-beta's `-p . --pretty false` output
-// for the same files, run from a binary and project on an APFS volume of the same case sensitivity, with the project
-// directory replaced by PROJECT.
+// Include and rootDir diagnostics that depend on the host's case sensitivity, which the CLI takes from the volume of
+// its executable and these tests from vfstest's flag. The expected text is tsgo 7.1.0-beta's `-p . --pretty false`
+// output for the same files, run from a binary and project on an APFS volume of the same case sensitivity, with the
+// project directory replaced by PROJECT.
 
 use std::sync::Arc;
 
@@ -149,4 +149,54 @@ fn case_sensitive_host_root_file_after_import_of_other_file_differing_in_non_asc
     Matched by default include pattern '**/*'
 "
     );
+}
+
+// rootDir containment compares with the host's case sensitivity (program.go:1857).
+fn root_dir_with_other_casing(
+    root_dir: &str,
+    dir: &str,
+    use_case_sensitive_file_names: bool,
+) -> String {
+    let files = [
+        (
+            "tsconfig.json".to_string(),
+            format!(
+                r#"{{"compilerOptions":{{{OPTIONS},"rootDir":"{root_dir}"}},"include":["{dir}"]}}"#
+            ),
+        ),
+        (format!("{dir}/a.ts"), "export const a: number = 1;\n".to_string()),
+    ];
+    tsc_output(&files, use_case_sensitive_file_names)
+}
+
+#[test]
+fn case_sensitive_host_root_dir_differing_in_casing() {
+    assert_eq!(
+        root_dir_with_other_casing("SRC", "src", true),
+        "error TS6059: File 'PROJECT/src/a.ts' is not under 'rootDir' 'PROJECT/SRC'. 'rootDir' is expected to contain all source files.
+  The file is in the program because:
+    Matched by include pattern 'src' in 'PROJECT/tsconfig.json'
+"
+    );
+}
+
+#[test]
+fn case_insensitive_host_root_dir_differing_in_casing() {
+    assert_eq!(root_dir_with_other_casing("SRC", "src", false), "");
+}
+
+#[test]
+fn case_sensitive_host_root_dir_differing_in_non_ascii_casing() {
+    assert_eq!(
+        root_dir_with_other_casing("ÉSRC", "ésrc", true),
+        "error TS6059: File 'PROJECT/ésrc/a.ts' is not under 'rootDir' 'PROJECT/ÉSRC'. 'rootDir' is expected to contain all source files.
+  The file is in the program because:
+    Matched by include pattern 'ésrc' in 'PROJECT/tsconfig.json'
+"
+    );
+}
+
+#[test]
+fn case_insensitive_host_root_dir_differing_in_non_ascii_casing() {
+    assert_eq!(root_dir_with_other_casing("ÉSRC", "ésrc", false), "");
 }
