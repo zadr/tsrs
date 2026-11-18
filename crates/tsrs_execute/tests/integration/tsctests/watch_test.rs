@@ -8,7 +8,10 @@
 
 use rustc_hash::FxHashMap;
 
-use super::{LATE_EVENT_WRITE, Scenario, ScenarioEdit, ScenarioFile, ScenarioOp, run_scenario};
+use super::{
+    LATE_EVENT_WRITE, REMOVE_UNTYPED_DIRECTORY, Scenario, ScenarioEdit, ScenarioFile, ScenarioOp,
+    run_scenario,
+};
 
 const LIB_FILE: &str = "/home/src/tslibs/TS/Lib/lib.esnext.full.d.ts";
 const LIB: &str = "/// <reference no-default-lib=\"true\"/>\ninterface Boolean {}\ninterface Function {}\ninterface CallableFunction {}\ninterface NewableFunction {}\ninterface IArguments {}\ninterface Number {}\ninterface Object {}\ninterface RegExp {}\ninterface String {}\ninterface Array<T> { length: number; [n: number]: T; }\ninterface ReadonlyArray<T> {}\n";
@@ -455,6 +458,65 @@ fn a_first_edit_after_the_signature_job_rechecks_only_the_edited_file() {
     }
 }
 
+// A deleted path under a recursive wildcard directory starts no cycle when its events say it was not a directory (a
+// symlink to one is not one to the backends) and it is not a file the wildcards match or the build read. Each skipped
+// cycle is checked: a fresh build after the delete equals the one before.
+#[test]
+fn deleting_a_file_the_build_cannot_read_runs_no_cycle() {
+    let config = r#"{ "extends": "./base.json", "compilerOptions": { "resolveJsonModule": true, "noEmit": true }, "include": ["**/*", "data/*.json"] }"#;
+    let main = "import d from \"./data/d.json\";\nimport { p } from \"pkg\";\nexport const n: string = d.n;\nexport const q: string = p;\n";
+    let files = [
+        ("app/tsconfig.json", config),
+        ("app/base.json", r#"{ "compilerOptions": { "target": "esnext", "strict": true } }"#),
+        ("app/main.ts", main),
+        ("app/data/d.json", r#"{ "n": 1 }"#),
+        ("app/node_modules/pkg/package.json", r#"{ "name": "pkg", "types": "lib/index.d.ts" }"#),
+        ("app/node_modules/pkg/lib/index.d.ts", "export declare const p: number;\n"),
+        ("app/\u{fc}.ts", "export const \u{fc}: number = 's';\n"),
+        ("app/gen/g.ts", "export const g: number = 's';\n"),
+        ("shared/s.ts", "export const s: number = 's';\n"),
+        ("app/.main.ts.swp", "swap"),
+        ("app/.DS_Store", "store"),
+        ("app/notes.txt", "notes"),
+        ("app/main.ts~", main),
+        ("app/notizen-\u{fc}.txt", "notes"),
+    ];
+    let mut files: Vec<ScenarioFile> =
+        files.iter().map(|(path, content)| file(&format!("{ROOT}/{path}"), content)).collect();
+    files.push(symlink("app/linked", "shared"));
+    let baseline = run_expecting(
+        "delete-non-source",
+        &["-w", "-p", "app"],
+        files,
+        vec![
+            ("swap file", vec![delete("app/.main.ts.swp")], Cycle::None),
+            (".DS_Store", vec![delete("app/.DS_Store")], Cycle::None),
+            ("text file", vec![delete("app/notes.txt")], Cycle::None),
+            ("editor backup", vec![delete("app/main.ts~")], Cycle::None),
+            ("non-ASCII text file", vec![delete("app/notizen-\u{fc}.txt")], Cycle::None),
+            ("non-ASCII source file", vec![delete("app/\u{fc}.ts")], Cycle::Runs),
+            ("JSON file the include lists", vec![delete("app/data/d.json")], Cycle::Runs),
+            (
+                "package.json module resolution read",
+                vec![delete("app/node_modules/pkg/package.json")],
+                Cycle::Runs,
+            ),
+            ("symlink to a directory of sources", vec![delete("app/linked")], Cycle::Runs),
+            (
+                "directory of sources, its type unknown",
+                vec![remove_untyped_directory("app/gen")],
+                Cycle::Runs,
+            ),
+            ("extended config", vec![delete("app/base.json")], Cycle::Runs),
+        ],
+        false,
+        true,
+    );
+    for code in ["TS2322", "TS2307", "TS5083"] {
+        assert!(baseline.contains(code), "the scenario reports {code}\n{baseline}");
+    }
+}
+
 // Runs `tsgo <args>` on `files` (paths under ROOT), asserts that no edit differs from a fresh build, and returns the
 // baseline. An edit that only touches files starts no cycle: its output is empty, unlike a fresh build's.
 fn run(
@@ -474,21 +536,53 @@ fn run_with(
     edits: Vec<(&str, Vec<ScenarioOp>)>,
     signature_job: bool,
 ) -> String {
-    let mut files: Vec<ScenarioFile> =
+    let edits = edits
+        .into_iter()
+        .map(|(caption, ops)| {
+            let cycle = if ops.iter().all(|op| op.op == "touch") {
+                Cycle::None
+            } else if ops.iter().any(|op| op.op == LATE_EVENT_WRITE) {
+                Cycle::Late
+            } else {
+                Cycle::Runs
+            };
+            (caption, ops, cycle)
+        })
+        .collect();
+    let files: Vec<ScenarioFile> =
         files.iter().map(|(path, content)| file(&format!("{ROOT}/{path}"), content)).collect();
+    run_expecting(name, args, files, edits, signature_job, false)
+}
+
+#[derive(Clone, Copy)]
+enum Cycle {
+    Runs,
+    // The watch runs no cycle; a fresh build gives what it gave before the edit.
+    None,
+    // A file's event comes with the next edit.
+    Late,
+}
+
+// `run_with`, with what each edit is expected to do.
+fn run_expecting(
+    name: &str,
+    args: &[&str],
+    mut files: Vec<ScenarioFile>,
+    edits: Vec<(&str, Vec<ScenarioOp>, Cycle)>,
+    signature_job: bool,
+    file_events_only: bool,
+) -> String {
     files.push(file(LIB_FILE, LIB));
     let mut all_ops: Vec<ScenarioOp> = Vec::new();
     let edits = edits
         .into_iter()
-        .map(|(caption, ops)| {
+        .map(|(caption, ops, cycle)| {
             // A fresh build has the files the edits wrote; a touch changes no content (and its file may be an output).
             all_ops.extend(ops.iter().filter(|op| op.op != "touch").map(clone_op));
-            let expected_diff = if ops.iter().all(|op| op.op == "touch") {
-                NO_CYCLE
-            } else if ops.iter().any(|op| op.op == LATE_EVENT_WRITE) {
-                LATE_EVENT
-            } else {
-                ""
+            let expected_diff = match cycle {
+                Cycle::Runs => "",
+                Cycle::None => NO_CYCLE,
+                Cycle::Late => LATE_EVENT,
             };
             ScenarioEdit {
                 caption: caption.to_string(),
@@ -496,6 +590,7 @@ fn run_with(
                 expected_diff: expected_diff.to_string(),
                 ops,
                 fresh_ops: all_ops.iter().map(clone_op).collect(),
+                same_build: matches!(cycle, Cycle::None),
             }
         })
         .collect();
@@ -511,6 +606,7 @@ fn run_with(
         default_libs: vec![LIB_FILE.to_string()],
         edits,
         signature_job,
+        file_events_only,
     };
     let baseline = run_scenario(&test);
     let diffs = baseline.matches("\nDiff:: ").count();
@@ -525,6 +621,23 @@ const LATE_EVENT: &str = "A file's event comes with the next edit";
 
 fn file(path: &str, content: &str) -> ScenarioFile {
     ScenarioFile { path: path.to_string(), content: content.to_string(), symlink: String::new() }
+}
+
+fn symlink(path: &str, target: &str) -> ScenarioFile {
+    ScenarioFile {
+        path: format!("{ROOT}/{path}"),
+        content: String::new(),
+        symlink: format!("{ROOT}/{target}"),
+    }
+}
+
+fn remove_untyped_directory(path: &str) -> ScenarioOp {
+    ScenarioOp {
+        op: REMOVE_UNTYPED_DIRECTORY.to_string(),
+        path: format!("{ROOT}/{path}"),
+        content: String::new(),
+        target: String::new(),
+    }
 }
 
 fn write_late_event(path: &str, content: &str) -> ScenarioOp {

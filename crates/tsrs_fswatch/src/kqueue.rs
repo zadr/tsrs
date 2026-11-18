@@ -383,9 +383,9 @@ impl KqueueBackend {
             for sub in &subs {
                 touch(touched, &sub.dir_watch);
                 if recreated {
-                    sub.dir_watch.events.update(&sub.path);
+                    sub.dir_watch.events.update_typed(&sub.path, Some(entry.is_dir));
                 } else {
-                    sub.dir_watch.events.remove(&sub.path);
+                    sub.dir_watch.events.remove_typed(&sub.path, Some(entry.is_dir));
                     // If we lost a directory, walk the entries map and
                     // close every fd we had open for descendants. Some
                     // kernels (OpenBSD in particular) deliver only the
@@ -433,7 +433,7 @@ impl KqueueBackend {
                     Some(false) => sub.dir_watch.write_finished(&sub.path),
                     None => {}
                 }
-                sub.dir_watch.events.update(&sub.path);
+                sub.dir_watch.events.update_typed(&sub.path, Some(entry.is_dir));
             }
         }
     }
@@ -540,7 +540,7 @@ impl KqueueBackend {
         let mut filtered_subs = Vec::new();
         for s in subs {
             if !s.dir_watch.recursive && path != s.dir_watch.dir {
-                s.dir_watch.events.update(path);
+                s.dir_watch.events.update_typed(path, Some(true));
                 touch(touched, &s.dir_watch);
             } else {
                 filtered_subs.push(s);
@@ -626,7 +626,7 @@ impl KqueueBackend {
                     if !self.watch_path_locked(&mut st, &sub.dir_watch, &full_path, map_id) {
                         continue;
                     }
-                    sub.dir_watch.events.update(&full_path);
+                    sub.dir_watch.events.update_typed(&full_path, Some(*ent_is_dir));
                     touch(touched, &sub.dir_watch);
                     if *ent_is_dir && sub.dir_watch.recursive {
                         self.walk_new_subtree_locked(&mut st, sub, map_id, &full_watch_path);
@@ -646,7 +646,7 @@ impl KqueueBackend {
                     }
                     continue;
                 }
-                sub.dir_watch.events.create(&full_path);
+                sub.dir_watch.events.create_typed(&full_path, Some(*ent_is_dir));
                 touch(touched, &sub.dir_watch);
 
                 // For recursive subscriptions, walk into the new directory
@@ -662,7 +662,7 @@ impl KqueueBackend {
             let mut to_remove = Vec::new();
             if let Some(m) = st.entry_maps.get(&map_id) {
                 // stale children are removed from disjoint subtrees and from per-path event entries; Go ranges the map too
-                to_remove.extend(m.keys().filter_map(|p| {
+                to_remove.extend(m.iter().filter_map(|(p, e)| {
                     let rest = p.strip_prefix(&dir_start)?;
                     if rest.contains('/') {
                         return None;
@@ -670,11 +670,11 @@ impl KqueueBackend {
                     if snapshot.current_display_paths.contains(p) {
                         return None;
                     }
-                    Some(p.clone())
+                    Some((p.clone(), e.is_dir))
                 }));
             }
-            for p in to_remove {
-                sub.dir_watch.events.remove(&p);
+            for (p, is_dir) in to_remove {
+                sub.dir_watch.events.remove_typed(&p, Some(is_dir));
                 touch(touched, &sub.dir_watch);
                 let descendants: Vec<(String, Option<i32>)> =
                     st.entry_maps.get(&map_id).map_or_default(|m| {
@@ -723,7 +723,7 @@ impl KqueueBackend {
                 state: None,
             };
             st.entry_maps.entry(map_id).or_default().insert(display_path.clone(), e);
-            sub.dir_watch.events.create(&display_path);
+            sub.dir_watch.events.create_typed(&display_path, Some(p_is_dir));
             self.watch_path_locked(st, &sub.dir_watch, &display_path, map_id);
         }
     }
@@ -782,7 +782,7 @@ impl KqState {
                 close_fd(fd);
                 closed.push(fd);
             }
-            w.events.remove(path);
+            w.events.remove_typed(path, Some(e.is_dir));
             self.subs_by_path.remove(path);
         }
         for fd in closed {

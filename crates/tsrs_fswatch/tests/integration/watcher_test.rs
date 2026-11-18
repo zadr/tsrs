@@ -251,6 +251,40 @@ fn watch_file_delete() {
     });
 }
 
+// tsrs-only: a delete says whether the path was a directory; a symlink to one is not.
+#[test]
+fn deleted_paths_say_whether_they_were_directories() {
+    run_for_each_watcher("DeletedPathsSayWhetherTheyWereDirectories", |t, w| {
+        let dir = new_tmp_dir(t);
+        let file = sub_path(&dir);
+        let sub = sub_path(&dir);
+        let link = sub_path(&dir);
+        write(&file, "x")?;
+        mkdir(&sub)?;
+        std::os::unix::fs::symlink(&sub, &link).map_err(|e| e.to_string())?;
+        let (r, _) = subscribe_for(t, &dir, w)?;
+        std::fs::remove_file(&file).map_err(|e| e.to_string())?;
+        std::fs::remove_file(&link).map_err(|e| e.to_string())?;
+        std::fs::remove_dir(&sub).map_err(|e| e.to_string())?;
+        let got = expect_event_set(
+            &r,
+            vec![
+                want(EventKind::DELETE, &file),
+                want(EventKind::DELETE, &link),
+                want(EventKind::DELETE, &sub),
+            ],
+        )?;
+        for (path, is_dir) in [(&file, Some(false)), (&link, Some(false)), (&sub, Some(true))] {
+            let types: Vec<Option<bool>> =
+                got.iter().filter(|e| e.path == *path).map(|e| e.is_dir).collect();
+            if types.iter().any(|t| *t != is_dir) {
+                return Err(format!("{path}: is_dir {types:?}, want {is_dir:?}"));
+            }
+        }
+        Ok(())
+    });
+}
+
 // ----- directories -------------------------------------------------------
 
 // watcher_test.go:946

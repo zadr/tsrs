@@ -28,13 +28,22 @@ impl std::fmt::Display for EventKind {
 pub struct Event {
     pub kind: EventKind,
     pub path: String,
+    // tsrs-only: whether the path is a directory, as the backend saw it (a symlink is not one), when every event of
+    // the batch for it agrees.
+    pub is_dir: Option<bool>,
     pub(crate) included_watch_root: bool,
 }
 
 impl Event {
     // Go `fswatch.Event{Kind: k, Path: p}` (the unexported field stays zero).
     pub fn new(kind: EventKind, path: impl Into<String>) -> Event {
-        Event { kind, path: path.into(), included_watch_root: false }
+        Event { kind, path: path.into(), is_dir: None, included_watch_root: false }
+    }
+
+    // tsrs-only.
+    #[must_use]
+    pub fn with_is_dir(self, is_dir: Option<bool>) -> Event {
+        Event { is_dir, ..self }
     }
 }
 
@@ -45,6 +54,8 @@ pub struct EventEntry {
     updated_seq: u64,
     deleted_seq: u64,
     included_watch_root: bool,
+    // tsrs-only (`Event::is_dir`).
+    is_dir: Option<bool>,
 }
 
 // eventList coalesces filesystem events by path within a debounce window.
@@ -69,44 +80,61 @@ impl EventList {
     // (create+delete within a batch cancels out).
     #[cfg(unix)]
     pub fn create(&self, path: &str) {
+        self.create_typed(path, None);
+    }
+
+    // tsrs-only: `create`, with whether `path` is a directory (`Event::is_dir`).
+    #[cfg(unix)]
+    pub fn create_typed(&self, path: &str, is_dir: Option<bool>) {
         let mut el = self.mu.lock().unwrap();
         let seq = el.next_seq_locked();
-        el.create_locked(path, seq);
+        el.create_locked(path, seq, is_dir);
     }
 
     // event.go:79
     // update records an update event for path.
     #[cfg(unix)]
     pub fn update(&self, path: &str) {
+        self.update_typed(path, None);
+    }
+
+    // tsrs-only: `update`, with whether `path` is a directory (`Event::is_dir`).
+    #[cfg(unix)]
+    pub fn update_typed(&self, path: &str, is_dir: Option<bool>) {
         let mut el = self.mu.lock().unwrap();
         let seq = el.next_seq_locked();
-        el.update_locked(path, seq);
+        el.update_locked(path, seq, is_dir);
     }
 
     // event.go:86
     #[cfg(target_os = "macos")] // only the FSEvents backend reports its own sequence numbers
-    pub(crate) fn update_at(&self, path: &str, seq: u64) {
+    pub(crate) fn update_at(&self, path: &str, seq: u64, is_dir: Option<bool>) {
         let mut el = self.mu.lock().unwrap();
         el.advance_seq_locked(seq);
-        el.update_locked(path, seq);
+        el.update_locked(path, seq, is_dir);
     }
 
     // event.go:93
     #[cfg(target_os = "macos")] // only the FSEvents backend reports its own sequence numbers
-    pub(crate) fn update_watch_root_at(&self, path: &str, seq: u64) {
+    pub(crate) fn update_watch_root_at(&self, path: &str, seq: u64, is_dir: Option<bool>) {
         let mut el = self.mu.lock().unwrap();
         el.advance_seq_locked(seq);
-        el.update_locked(path, seq);
-        el.get_or_create(path).included_watch_root = true;
+        el.update_locked(path, seq, is_dir).included_watch_root = true;
     }
 
     // event.go:106
     // remove records a delete event for path.
     #[cfg(unix)]
     pub fn remove(&self, path: &str) {
+        self.remove_typed(path, None);
+    }
+
+    // tsrs-only: `remove`, with whether `path` was a directory (`Event::is_dir`).
+    #[cfg(unix)]
+    pub fn remove_typed(&self, path: &str, is_dir: Option<bool>) {
         let mut el = self.mu.lock().unwrap();
         let seq = el.next_seq_locked();
-        el.remove_locked(path, seq);
+        el.remove_locked(path, seq, is_dir);
     }
 
     // event.go:113
@@ -117,25 +145,24 @@ impl EventList {
     fn remove_and_get_sequence(&self, path: &str) -> u64 {
         let mut el = self.mu.lock().unwrap();
         let seq = el.next_seq_locked();
-        el.remove_locked(path, seq);
+        el.remove_locked(path, seq, None);
         seq
     }
 
     // event.go:121
     #[cfg(target_os = "macos")] // only the FSEvents backend reports its own sequence numbers
-    pub(crate) fn remove_at(&self, path: &str, seq: u64) {
+    pub(crate) fn remove_at(&self, path: &str, seq: u64, is_dir: Option<bool>) {
         let mut el = self.mu.lock().unwrap();
         el.advance_seq_locked(seq);
-        el.remove_locked(path, seq);
+        el.remove_locked(path, seq, is_dir);
     }
 
     // event.go:128
     #[cfg(target_os = "macos")] // only the FSEvents backend reports its own sequence numbers
-    pub(crate) fn remove_watch_root_at(&self, path: &str, seq: u64) {
+    pub(crate) fn remove_watch_root_at(&self, path: &str, seq: u64, is_dir: Option<bool>) {
         let mut el = self.mu.lock().unwrap();
         el.advance_seq_locked(seq);
-        el.remove_locked(path, seq);
-        el.get_or_create(path).included_watch_root = true;
+        el.remove_locked(path, seq, is_dir).included_watch_root = true;
     }
 
     // event.go:142
@@ -216,8 +243,8 @@ impl EventList {
 impl EventListState {
     // event.go:65
     #[cfg(unix)]
-    fn create_locked(&mut self, path: &str, seq: u64) {
-        let entry = self.get_or_create(path);
+    fn create_locked(&mut self, path: &str, seq: u64, is_dir: Option<bool>) {
+        let entry = self.get_or_create(path, is_dir);
         if entry.is_deleted() {
             // Rapid delete+recreate: clear both flags so the entry
             // emits EventUpdate (the default for non-deleted entries).
@@ -232,14 +259,17 @@ impl EventListState {
 
     // event.go:101
     #[cfg(unix)]
-    fn update_locked(&mut self, path: &str, seq: u64) {
-        self.get_or_create(path).updated_seq = seq;
+    fn update_locked(&mut self, path: &str, seq: u64, is_dir: Option<bool>) -> &mut EventEntry {
+        let entry = self.get_or_create(path, is_dir);
+        entry.updated_seq = seq;
+        entry
     }
 
     // event.go:135
-    fn remove_locked(&mut self, path: &str, seq: u64) {
-        let entry = self.get_or_create(path);
+    fn remove_locked(&mut self, path: &str, seq: u64, is_dir: Option<bool>) -> &mut EventEntry {
+        let entry = self.get_or_create(path, is_dir);
         entry.deleted_seq = seq;
+        entry
     }
 
     // event.go:150
@@ -255,17 +285,27 @@ impl EventListState {
         // order-independent: entries are keyed by path, so a batch has at most one event per path, and Go ranges the map too (getEvents: "Order is not guaranteed")
         out.extend(self.entries.iter().filter_map(|(path, e)| {
             let kind = e.kind_since(start_seq)?;
-            Some(Event { kind, path: path.clone(), included_watch_root: e.included_watch_root })
+            Some(Event {
+                kind,
+                path: path.clone(),
+                is_dir: e.is_dir,
+                included_watch_root: e.included_watch_root,
+            })
         }));
         out
     }
 
     // event.go:223
-    fn get_or_create(&mut self, path: &str) -> &mut EventEntry {
+    fn get_or_create(&mut self, path: &str, is_dir: Option<bool>) -> &mut EventEntry {
         if !self.entries.contains_key(path) {
-            self.entries.insert(path.to_string(), EventEntry::default());
+            self.entries.insert(path.to_string(), EventEntry { is_dir, ..EventEntry::default() });
         }
-        self.entries.get_mut(path).unwrap()
+        let entry = self.entries.get_mut(path).unwrap();
+        // tsrs-only: events that disagree about what the path is leave it unknown.
+        if entry.is_dir != is_dir {
+            entry.is_dir = None;
+        }
+        entry
     }
 
     // event.go:241
@@ -294,7 +334,12 @@ impl EventEntry {
     // tsrs-only: the event `snapshot_since_locked` makes of this entry.
     pub(crate) fn event_since(&self, path: &str, start_seq: u64) -> Option<Event> {
         let kind = self.kind_since(start_seq)?;
-        Some(Event { kind, path: path.to_string(), included_watch_root: self.included_watch_root })
+        Some(Event {
+            kind,
+            path: path.to_string(),
+            is_dir: self.is_dir,
+            included_watch_root: self.included_watch_root,
+        })
     }
 
     fn kind_since(&self, start_seq: u64) -> Option<EventKind> {

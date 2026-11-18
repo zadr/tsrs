@@ -280,12 +280,20 @@ impl TestSys {
                 continue;
             }
             match old_snap.snap.get(&path) {
-                None => changes.push(super::mockwatch::FileChange { path, deleted: false }),
+                None => changes.push(super::mockwatch::FileChange {
+                    path,
+                    deleted: false,
+                    is_dir: Some(false),
+                }),
                 Some(old)
                     if *tsrs_core::utf8::from_utf8_lossy(&file.data) != *old.content
                         || file.mod_time != old.m_time =>
                 {
-                    changes.push(super::mockwatch::FileChange { path, deleted: false });
+                    changes.push(super::mockwatch::FileChange {
+                        path,
+                        deleted: false,
+                        is_dir: Some(false),
+                    });
                 }
                 Some(_) => {}
             }
@@ -296,7 +304,12 @@ impl TestSys {
         )]
         for path in old_snap.snap.keys() {
             if self.map_fs().get_file_info(path).is_none() {
-                changes.push(super::mockwatch::FileChange { path: path.clone(), deleted: true });
+                // A file or a symlink: neither is a directory to a watch backend.
+                changes.push(super::mockwatch::FileChange {
+                    path: path.clone(),
+                    deleted: true,
+                    is_dir: Some(false),
+                });
             }
         }
         changes

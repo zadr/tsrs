@@ -51,6 +51,8 @@ struct ScenarioEdit {
     expected_diff: String,
     ops: Vec<ScenarioOp>,
     fresh_ops: Vec<ScenarioOp>,
+    // tsrs-only: the edit changes nothing a build reads, so a fresh build after it must equal one before it.
+    same_build: bool,
 }
 
 struct Scenario {
@@ -66,6 +68,9 @@ struct Scenario {
     edits: Vec<ScenarioEdit>,
     // tsrs-only: run the watch's signature job after each cycle (`CommandLineTesting::run_signature_job`).
     signature_job: bool,
+    // tsrs-only: the watch backend reports each changed path alone, as FSEvents and recursive watches do (Go's mock
+    // also reports its parent directories).
+    file_events_only: bool,
 }
 
 fn s(v: Option<&Value>) -> String {
@@ -132,6 +137,7 @@ fn load_scenario(path: &FsPath) -> Scenario {
                     expected_diff: s(e.get("expectedDiff")),
                     ops: ops(e.get("ops")),
                     fresh_ops: ops(e.get("freshOps")),
+                    same_build: false,
                 }
             })
             .collect(),
@@ -152,6 +158,7 @@ fn load_scenario(path: &FsPath) -> Scenario {
         default_libs: strings(o.get("defaultLibs")).unwrap_or_default(),
         edits,
         signature_job: false,
+        file_events_only: false,
     }
 }
 
@@ -218,12 +225,16 @@ fn new_test_sys(test: &Scenario) -> &'static TestSys {
 /// after the cycle took its events.
 pub const LATE_EVENT_WRITE: &str = "writeLateEvent";
 
+/// tsrs-only: a directory removed with one event for the directory alone, which does not say what the path was (a
+/// rename out of the watched tree, reported with merged flags).
+pub const REMOVE_UNTYPED_DIRECTORY: &str = "removeUntypedDirectory";
+
 fn apply_ops(sys: &TestSys, ops: &[ScenarioOp]) {
     let fs = sys.fs_from_file_map();
     for op in ops {
         match op.op.as_str() {
             "write" | LATE_EVENT_WRITE => fs.write_file(&op.path, &op.content).unwrap(),
-            "delete" => fs.remove(&op.path).unwrap(),
+            "delete" | REMOVE_UNTYPED_DIRECTORY => fs.remove(&op.path).unwrap(),
             "symlink" => {
                 let dir = tspath::get_directory_path(&op.path);
                 let _ = sys.map_fs().mkdir_all(
@@ -362,13 +373,25 @@ fn run_scenario(test: &Scenario) -> String {
         let (deferred, mut changed_paths): (Vec<_>, Vec<_>) =
             sys.changed_paths().into_iter().partition(|change| late.contains(change.path.as_str()));
         changed_paths.extend(std::mem::replace(&mut late_changes, deferred));
+        for op in edit.ops.iter().filter(|op| op.op == REMOVE_UNTYPED_DIRECTORY) {
+            let below = format!("{}/", op.path);
+            changed_paths.retain(|change| !change.path.starts_with(&below));
+            changed_paths.push(mockwatch::FileChange {
+                path: op.path.clone(),
+                deleted: true,
+                is_dir: None,
+            });
+        }
         sys.baseline_fs_with_diff(&mut baseline);
         match &mut watcher {
             None => {
                 execute_command(sys, &mut baseline, &args);
             }
             Some(watcher) => {
-                sys.mock_watch_backend.get().unwrap().send_changed_paths(&changed_paths);
+                sys.mock_watch_backend
+                    .get()
+                    .unwrap()
+                    .send_changed_paths(&changed_paths, !test.file_events_only);
                 watcher.do_cycle();
             }
         }
@@ -385,6 +408,24 @@ fn run_scenario(test: &Scenario) -> String {
             args.clone(),
             Some(testing),
         );
+
+        if edit.same_build {
+            let before_sys = new_test_sys(test);
+            if let Some(previous) = index.checked_sub(1) {
+                apply_ops(before_sys, &test.edits[previous].fresh_ops);
+            }
+            let testing: &'static dyn CommandLineTesting = before_sys;
+            tsrs_execute::execute::command_line_with_testing(
+                before_sys,
+                args.clone(),
+                Some(testing),
+            );
+            let diff = get_diff_for_incremental(before_sys, non_incremental_sys);
+            if !diff.is_empty() {
+                write!(baseline, "\n\nDiff:: !!! The edit changed a fresh build !!!\n{diff}")
+                    .unwrap();
+            }
+        }
 
         let diff = get_diff_for_incremental(sys, non_incremental_sys);
         if !diff.is_empty() {

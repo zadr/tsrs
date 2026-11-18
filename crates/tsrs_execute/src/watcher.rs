@@ -24,7 +24,7 @@ use crate::tsc::{
     self, CommandLineTesting, DiagnosticReporter, DiagnosticsReporter, EmitInput,
     ExtendedConfigCache, System,
 };
-use crate::watchmanager::{self, DirWatchSet, WatchManager, WatchState};
+use crate::watchmanager::{self, Change, DirWatchSet, WatchManager, WatchState};
 use crate::watchmem::{FileRegions, Freer};
 
 #[derive(Clone, Copy)]
@@ -602,7 +602,7 @@ impl Watcher {
     // beside the config), each would look like a new project file and start a full rebuild after every cycle; the
     // TypeScript (JavaScript) watch ignores the program's emitted files the same way (isIgnoredFileFromWildCardWatching).
     // Go does not (tsgo runs that second cycle). An output that is also a source of the program is kept.
-    fn drop_own_output_events(&self, changed_paths: &mut FxHashMap<String, EventKind>) {
+    fn drop_own_output_events(&self, changed_paths: &mut FxHashMap<String, Change>) {
         if self.own_outputs.is_empty() || self.program.is_none() {
             return;
         }
@@ -642,11 +642,11 @@ impl Watcher {
     // nothing: the cycle would reuse the parsed file (`watchCompilerHost`), so it is dropped. Such events come from
     // metadata changes (chmod, extended attributes) and from writes made just before the watch started, which
     // FSEvents delivers after (about 12 ms late). Go runs a cycle for them.
-    fn drop_unchanged_file_events(&self, changed_paths: &mut FxHashMap<String, EventKind>) {
+    fn drop_unchanged_file_events(&self, changed_paths: &mut FxHashMap<String, Change>) {
         let fs = self.sys.fs();
         let before = changed_paths.len();
-        changed_paths.retain(|event_path, kind| {
-            if *kind != EventKind::UPDATE {
+        changed_paths.retain(|event_path, change| {
+            if change.kind != EventKind::UPDATE {
                 return true;
             }
             let Some(cached) = self.source_file_cache.load(&self.to_path(event_path)) else {
@@ -683,7 +683,7 @@ impl Watcher {
     fn is_relevant_change(
         &self,
         state: &WatchState,
-        changed_paths: &FxHashMap<String, EventKind>,
+        changed_paths: &FxHashMap<String, Change>,
     ) -> bool {
         let fs = self.sys.fs();
         let opts = self.compare_paths_options();
@@ -692,10 +692,15 @@ impl Watcher {
         sorted_keys(changed_paths).into_iter().any(|event_path| {
             let p = self.to_path(event_path);
             // tsrs-only: Go also asks `PossiblyMatchesDirectoryName` of a changed file, which is true of any file under a
-            // recursive wildcard directory (an editor's swap file, a log, a .md), so each write to one rebuilt the
-            // program. Only a directory (or a deleted path, which may have been one) can bring in files that match.
+            // recursive wildcard directory (an editor's swap file, a log, a .md), so each write or delete of one rebuilt
+            // the program. Only a directory can bring in files that match: one that exists, or a deleted path unless
+            // its events say it was not one. A deleted symlink is not a directory to the backends, but the build may
+            // have read files through it.
             let maybe_directory = || {
-                changed_paths[event_path] == EventKind::DELETE || fs.directory_exists(event_path)
+                let change = changed_paths[event_path];
+                (change.kind == EventKind::DELETE
+                    && (change.is_dir != Some(false) || self.seen_dirs.contains(&p)))
+                    || fs.directory_exists(event_path)
             };
             content_mapper_watched_files.contains(&p)
                 || self.seen_files.contains(&p)
@@ -1071,7 +1076,7 @@ impl Watcher {
         live
     }
 
-    fn evict_changed_source_files(&self, changed_paths: &FxHashMap<String, EventKind>) {
+    fn evict_changed_source_files(&self, changed_paths: &FxHashMap<String, Change>) {
         for event_path in sorted_keys(changed_paths) {
             let p = self.to_path(event_path);
             if self.source_file_cache.load(&p).is_some() {
@@ -1101,10 +1106,7 @@ impl Watcher {
         })
     }
 
-    fn content_mapper_manifest_changed(
-        &self,
-        changed_paths: &FxHashMap<String, EventKind>,
-    ) -> bool {
+    fn content_mapper_manifest_changed(&self, changed_paths: &FxHashMap<String, Change>) -> bool {
         let options = self.compare_paths_options();
         let mut changed_path_keys: Option<FxHashSet<Path>> = None;
         self.config
@@ -1216,7 +1218,7 @@ fn seen_directories(files: &FxHashSet<Path>) -> FxHashSet<Path> {
 }
 
 // Go ranges over the event map; the order only matters for debug logs and the first matching reason.
-fn sorted_keys(changed_paths: &FxHashMap<String, EventKind>) -> Vec<&String> {
+fn sorted_keys(changed_paths: &FxHashMap<String, Change>) -> Vec<&String> {
     let mut keys: Vec<&String> = changed_paths.keys().collect();
     keys.sort();
     keys

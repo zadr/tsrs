@@ -464,6 +464,12 @@ pub(crate) fn fs_events_callback(cb: &StreamCallback, payload: &FsEventsCallback
         let is_renamed = flag & FLAG_ITEM_RENAMED != 0;
         let is_created = flag & FLAG_ITEM_CREATED != 0;
         let is_done = flag & FLAG_HISTORY_DONE != 0;
+        // FSEvents merges the flags of a path's events in a batch: one that was both a file and a directory has both.
+        let is_dir = match flag & (FLAG_ITEM_IS_FILE | FLAG_ITEM_IS_DIR | FLAG_ITEM_IS_SYMLINK) {
+            FLAG_ITEM_IS_DIR => Some(true),
+            FLAG_ITEM_IS_FILE | FLAG_ITEM_IS_SYMLINK => Some(false),
+            _ => None,
+        };
 
         if flag & FLAG_MUST_SCAN_SUB_DIRS != 0 {
             let overflow = if flag & FLAG_USER_DROPPED != 0 {
@@ -552,9 +558,9 @@ pub(crate) fn fs_events_callback(cb: &StreamCallback, payload: &FsEventsCallback
 
             if is_removed && !is_created {
                 if display_path == w.dir {
-                    w.events.remove_watch_root_at(&display_path, event_id);
+                    w.events.remove_watch_root_at(&display_path, event_id, is_dir);
                 } else {
-                    w.events.remove_at(&display_path, event_id);
+                    w.events.remove_at(&display_path, event_id, is_dir);
                 }
                 if w.terminate_callbacks_for_deleted_root(
                     &display_path,
@@ -574,15 +580,15 @@ pub(crate) fn fs_events_callback(cb: &StreamCallback, payload: &FsEventsCallback
                 }
                 if path_exists {
                     if display_path == w.dir {
-                        w.events.update_watch_root_at(&display_path, event_id);
+                        w.events.update_watch_root_at(&display_path, event_id, is_dir);
                     } else {
-                        w.events.update_at(&display_path, event_id);
+                        w.events.update_at(&display_path, event_id, is_dir);
                     }
                 } else {
                     if display_path == w.dir {
-                        w.events.remove_watch_root_at(&display_path, event_id);
+                        w.events.remove_watch_root_at(&display_path, event_id, is_dir);
                     } else {
-                        w.events.remove_at(&display_path, event_id);
+                        w.events.remove_at(&display_path, event_id, is_dir);
                     }
                     if w.terminate_callbacks_for_deleted_root(
                         &display_path,
@@ -597,9 +603,9 @@ pub(crate) fn fs_events_callback(cb: &StreamCallback, payload: &FsEventsCallback
                     }
                 }
             } else if display_path == w.dir {
-                w.events.update_watch_root_at(&display_path, event_id);
+                w.events.update_watch_root_at(&display_path, event_id, is_dir);
             } else {
-                w.events.update_at(&display_path, event_id);
+                w.events.update_at(&display_path, event_id, is_dir);
             }
             touch(w);
         }

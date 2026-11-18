@@ -96,3 +96,28 @@ fn event_list_drain_for_sequences() {
     let got = &events_by_callback[1][0];
     assert!(got.kind == EventKind::DELETE && got.path == "file.txt");
 }
+
+// tsrs-only: a path keeps what its events say it is while they agree.
+#[test]
+fn event_list_keeps_whether_a_path_is_a_directory_while_its_events_agree() {
+    let el = EventList::default();
+    el.update_typed("file", Some(false));
+    el.remove_typed("file", Some(false));
+    el.create_typed("dir", Some(true));
+    el.remove_typed("replaced", Some(true));
+    el.create_typed("replaced", Some(false));
+    el.remove_typed("replaced", Some(false));
+    el.remove_typed("untyped", None);
+    let mut got: Vec<(String, Option<bool>)> =
+        el.get_events().into_iter().map(|e| (e.path, e.is_dir)).collect();
+    got.sort();
+    assert_eq!(
+        got,
+        [
+            ("dir".to_string(), Some(true)),
+            ("file".to_string(), Some(false)),
+            ("replaced".to_string(), None),
+            ("untyped".to_string(), None),
+        ]
+    );
+}

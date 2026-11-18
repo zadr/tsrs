@@ -31,6 +31,8 @@ impl Watch for MockCloser {
 pub struct FileChange {
     pub(crate) path: String,
     pub(crate) deleted: bool,
+    // tsrs-only (`Event::is_dir`).
+    pub(crate) is_dir: Option<bool>,
 }
 
 pub struct MockWatchBackend {
@@ -116,19 +118,22 @@ impl MockWatchBackend {
     }
 
     /// Go `SendChangedPaths`: an event per changed file, plus update events for its parent directories (real
-    /// watchers report a new child directory to a non-recursive watch on its parent).
-    pub(crate) fn send_changed_paths(&self, changes: &[FileChange]) {
+    /// watchers report a new child directory to a non-recursive watch on its parent) unless `!parents` (tsrs-only).
+    pub(crate) fn send_changed_paths(&self, changes: &[FileChange], parents: bool) {
         let mut events = Vec::with_capacity(changes.len() * 2);
         let mut seen_dirs: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
         for c in changes {
             let kind = if c.deleted { EventKind::DELETE } else { EventKind::UPDATE };
-            events.push(Event::new(kind, c.path.clone()));
+            events.push(Event::new(kind, c.path.clone()).with_is_dir(c.is_dir));
+            if !parents {
+                continue;
+            }
             let mut dir = path_dir(&c.path);
             while !dir.is_empty() && dir != "/" && dir != "." {
                 if !seen_dirs.insert(dir.clone()) {
                     break;
                 }
-                events.push(Event::new(EventKind::UPDATE, dir.clone()));
+                events.push(Event::new(EventKind::UPDATE, dir.clone()).with_is_dir(Some(true)));
                 let parent = path_dir(&dir);
                 if parent == dir {
                     break;

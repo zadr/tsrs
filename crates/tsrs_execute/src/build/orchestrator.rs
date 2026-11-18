@@ -900,7 +900,7 @@ impl Orchestrator {
     // the version the cache holds (`read_by_every_task`).
     fn drop_unchanged_file_events(
         &self,
-        changed_paths: &mut FxHashMap<String, tsrs_fswatch::EventKind>,
+        changed_paths: &mut FxHashMap<String, watchmanager::Change>,
     ) {
         let Some(cache) = &self.host().watch_source_files else {
             return;
@@ -935,8 +935,8 @@ impl Orchestrator {
         let tasks: Vec<P<BuildTask>> =
             order.iter().map(|config| self.get_task(&self.to_path(config))).collect();
         let before = changed_paths.len();
-        changed_paths.retain(|path, kind| {
-            *kind != tsrs_fswatch::EventKind::UPDATE
+        changed_paths.retain(|path, change| {
+            change.kind != tsrs_fswatch::EventKind::UPDATE
                 || versions
                     .get(path)
                     .is_none_or(|versions| !self.read_by_every_task(path, versions, &tasks))
@@ -1077,7 +1077,7 @@ impl Orchestrator {
     fn build_changes(
         &'static self,
         state: &mut watchmanager::WatchState,
-        changed_paths: &FxHashMap<String, tsrs_fswatch::EventKind>,
+        changed_paths: &FxHashMap<String, watchmanager::Change>,
         overflow: bool,
     ) {
         self.invalidate_realpaths(changed_paths, overflow);
@@ -1200,12 +1200,12 @@ impl Orchestrator {
     fn check_tasks_for_event_changes(
         &'static self,
         state: &watchmanager::WatchState,
-        changed_paths: &FxHashMap<String, tsrs_fswatch::EventKind>,
+        changed_paths: &FxHashMap<String, watchmanager::Change>,
         needs_config_update: &mut bool,
         needs_update: &mut bool,
     ) {
         let normalized_paths: FxHashMap<Path, tsrs_fswatch::EventKind> =
-            changed_paths.iter().map(|(p, &k)| (self.to_path(p), k)).collect();
+            changed_paths.iter().map(|(p, c)| (self.to_path(p), c.kind)).collect();
         let order = self.order.lock().unwrap().clone();
         for config in &order {
             let path = self.to_path(config);
@@ -1274,7 +1274,7 @@ impl Orchestrator {
     fn file_names_may_change(
         &self,
         resolved: &tsrs_tsoptions::ParsedCommandLine,
-        changed_paths: &FxHashMap<String, tsrs_fswatch::EventKind>,
+        changed_paths: &FxHashMap<String, watchmanager::Change>,
     ) -> bool {
         if resolved.config_file.is_none()
             || resolved
@@ -1526,7 +1526,7 @@ impl Orchestrator {
 
     fn invalidate_realpaths(
         &self,
-        changed_paths: &FxHashMap<String, tsrs_fswatch::EventKind>,
+        changed_paths: &FxHashMap<String, watchmanager::Change>,
         overflow: bool,
     ) {
         let fs = CompilerHost::fs(self.host());

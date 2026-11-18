@@ -273,7 +273,7 @@ impl InotifyBackend {
             return false;
         }
         if ev.mask & (libc::IN_CREATE | libc::IN_MOVED_TO) != 0 {
-            w.events.create(&path);
+            w.events.create_typed(&path, Some(is_dir));
             if ev.mask & libc::IN_CREATE != 0
                 && !is_dir
                 && crate::watcher::write_settling()
@@ -294,7 +294,7 @@ impl InotifyBackend {
                 }
             }
         } else if ev.mask & libc::IN_MODIFY != 0 {
-            w.events.update(&path);
+            w.events.update_typed(&path, Some(is_dir));
             if crate::watcher::write_settling() {
                 w.write_started(&path);
             }
@@ -323,7 +323,8 @@ impl InotifyBackend {
                     }
                 }
             }
-            w.events.remove(&path);
+            // A watch is on a directory, so a `*_SELF` event is about one.
+            w.events.remove_typed(&path, Some(is_dir || is_self_event));
             if is_self_event && path == w.dir {
                 w.events.set_error(err_watched_directory_removed());
             }

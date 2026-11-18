@@ -75,9 +75,17 @@ pub struct WatchState {
     next_id: u64,
 }
 
+/// tsrs-only: what the events drained for a cycle say of a path.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Change {
+    pub(crate) kind: EventKind,
+    /// `tsrs_fswatch::Event::is_dir`, `None` once two events disagree.
+    pub(crate) is_dir: Option<bool>,
+}
+
 #[derive(Default)]
 struct ChangedState {
-    paths: Option<FxHashMap<String, EventKind>>,
+    paths: Option<FxHashMap<String, Change>>,
     overflow: bool,
 }
 
@@ -160,7 +168,7 @@ impl WatchManager {
     }
 
     /// Go `DrainEvents`.
-    pub(crate) fn drain_events(&self) -> (FxHashMap<String, EventKind>, bool) {
+    pub(crate) fn drain_events(&self) -> (FxHashMap<String, Change>, bool) {
         let mut changed = self.changed();
         (changed.paths.take().unwrap_or_default(), std::mem::take(&mut changed.overflow))
     }
@@ -171,7 +179,7 @@ impl WatchManager {
             let mut changed = self.changed();
             let map = changed.paths.get_or_insert_with(FxHashMap::default);
             for path in paths {
-                map.insert(path, EventKind::UPDATE);
+                map.insert(path, Change { kind: EventKind::UPDATE, is_dir: None });
             }
         }
         self.signal_do_cycle();
@@ -222,7 +230,13 @@ impl WatchManager {
                 FxHashMap::with_capacity_and_hasher(events.len(), rustc_hash::FxBuildHasher)
             });
             for e in events {
-                paths.insert(e.path.clone(), e.kind);
+                paths
+                    .entry(e.path.clone())
+                    .and_modify(|c| {
+                        c.kind = e.kind;
+                        c.is_dir = c.is_dir.filter(|&known| Some(known) == e.is_dir);
+                    })
+                    .or_insert(Change { kind: e.kind, is_dir: e.is_dir });
             }
         }
         self.signal_do_cycle();
