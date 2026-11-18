@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use tsrs_ast::new_compiler_diagnostic;
-use tsrs_compiler::{ProgramOptions, new_cached_fs_compiler_host, new_program};
+use tsrs_compiler::{ProgramOptions, new_compiler_host, new_program};
 use tsrs_core::P;
 use tsrs_core::tspath;
 use tsrs_diagnostics as diagnostics;
@@ -16,6 +16,8 @@ use crate::tsc::{
     create_diagnostic_formatter, create_diagnostic_reporter, create_report_error_summary,
     emit_and_report_statistics,
 };
+
+type CachedFS = tsrs_vfs::cachedvfs::FS<Arc<dyn FS>>;
 
 // The system doubles as the config-parsing host (Go's tsc.System satisfies tsoptions.ParseConfigHost).
 pub struct SysParseConfigHost {
@@ -132,7 +134,7 @@ pub fn command_line_with_testing(
     if tsrs_core::NO_THREADS {
         force_single_threaded(&mut command);
     }
-    tsc_compilation(sys, host, P::new(command), testing)
+    tsc_compilation(sys, P::new(command), testing)
 }
 
 fn configure_performance(raw: &CompilerOptionsValue) {
@@ -155,7 +157,6 @@ fn force_single_threaded(command: &mut ParsedCommandLine) {
 
 fn tsc_compilation(
     sys: &'static dyn System,
-    host: &'static SysParseConfigHost,
     command_line: P<ParsedCommandLine>,
     testing: Option<&'static dyn tsc::CommandLineTesting>,
 ) -> CommandLineResult {
@@ -276,6 +277,10 @@ fn tsc_compilation(
     let compiler_options_from_command_line = command_line_options;
     let mut config_for_compilation = command_line;
     let extended_config_cache: Arc<ExtendedConfigCache> = Arc::new(ExtendedConfigCache::default());
+    // tsrs-only: the program's cached file system. Config parsing reads through it disabled, as Go's does through
+    // sys.FS(), and the include glob hands it the listings it read (`FS::keep_accessible_entries`), from which
+    // program construction answers probes of names in those directories.
+    let program_fs: Arc<CachedFS> = Arc::new(tsrs_vfs::cachedvfs::from(sys.fs()));
     let mut compile_times = CompileTimes::default();
     let mut report_diagnostic = report_diagnostic;
     // Wrap command line options in a "compilerOptions" key to match tsconfig.json structure
@@ -292,6 +297,8 @@ fn tsc_compilation(
             sys,
             compiler_options_from_command_line.diagnostics_enabled(),
         );
+        program_fs.disable_and_clear_cache();
+        let config_host = SysParseConfigHost { sys, fs: Arc::clone(&program_fs) as Arc<dyn FS> };
         // tsrs-only: parsed on the compiler's worker pool, so that the include glob's parallel listing prefetch runs on
         // the pool program construction uses next instead of starting rayon's global pool (one thread per vCPU, which
         // nothing else in a run needs).
@@ -300,10 +307,11 @@ fn tsc_compilation(
                 &config_file_name,
                 Some(&compiler_options_from_command_line),
                 command_line_raw.as_ref(),
-                host,
+                &config_host,
                 Some(&*extended_config_cache),
             )
         });
+        program_fs.enable();
         compile_times.config_time = config_start.elapsed();
         if !errors.is_empty() {
             // these are unrecoverable errors--exit to report them as diagnostics
@@ -352,6 +360,7 @@ fn tsc_compilation(
     if config_for_compilation.compiler_options().unwrap().is_incremental() {
         return perform_incremental_compilation(
             sys,
+            &program_fs,
             config_for_compilation,
             &report_diagnostic,
             format_diagnostic.as_ref(),
@@ -363,6 +372,7 @@ fn tsc_compilation(
     }
     perform_compilation(
         sys,
+        &program_fs,
         config_for_compilation,
         &report_diagnostic,
         format_diagnostic.as_ref(),
@@ -406,6 +416,7 @@ fn start_tracing_if_needed(sys: &dyn System, config: &ParsedCommandLine) {
 
 fn perform_compilation(
     sys: &'static dyn System,
+    fs: &Arc<CachedFS>,
     config: P<ParsedCommandLine>,
     report_diagnostic: &tsc::DiagnosticReporter,
     format_diagnostic: Option<&tsc::DiagnosticFormatter>,
@@ -421,9 +432,9 @@ fn perform_compilation(
         host: content_mapper_host.clone(),
         project: content_mapper_project.clone(),
     };
-    let host = new_cached_fs_compiler_host(
+    let host = new_compiler_host(
         sys.get_current_directory(),
-        sys.fs(),
+        Arc::clone(fs) as Arc<dyn FS>,
         sys.default_library_path(),
         Some(extended_config_cache),
         Some(get_trace_from_sys(sys, testing)),
@@ -464,6 +475,7 @@ fn perform_compilation(
     let parse_start =
         tsc::DiagnosticTimer::new(sys, config.compiler_options().unwrap().diagnostics_enabled());
     let program = new_program(program_options);
+    fs.clear_listings();
     compile_times.parse_time = parse_start.elapsed();
     if let Some(content_mapper_host) = &content_mapper_host {
         compile_times.content_mapper_times = content_mapper_host.timings();
@@ -492,6 +504,7 @@ fn perform_compilation(
 // tsc.go:308
 fn perform_incremental_compilation(
     sys: &'static dyn System,
+    fs: &Arc<CachedFS>,
     config: P<ParsedCommandLine>,
     report_diagnostic: &tsc::DiagnosticReporter,
     format_diagnostic: Option<&tsc::DiagnosticFormatter>,
@@ -507,9 +520,9 @@ fn perform_incremental_compilation(
         host: content_mapper_host.clone(),
         project: content_mapper_project.clone(),
     };
-    let host = new_cached_fs_compiler_host(
+    let host = new_compiler_host(
         sys.get_current_directory(),
-        sys.fs(),
+        Arc::clone(fs) as Arc<dyn FS>,
         sys.default_library_path(),
         Some(extended_config_cache),
         Some(get_trace_from_sys(sys, testing)),
@@ -561,6 +574,7 @@ fn perform_incremental_compilation(
                 (read.join().unwrap(), program)
             })
         };
+    fs.clear_listings();
     compile_times.build_info_read_time = build_info_read_time;
     compile_times.parse_time = parse_time;
     let changes_compute_start =

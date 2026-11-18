@@ -402,6 +402,7 @@ impl RequestParams {
                             files: str_list(d.get("files"), "directory files")?,
                             directories: str_list(d.get("directories"), "directory directories")?,
                             symlinks: None,
+                            exact: false,
                         },
                     ));
 
@@ -549,6 +550,7 @@ impl RequestFileSystem {
                         files: entries.files.clone(),
                         directories: entries.directories.clone(),
                         symlinks: None,
+                        exact: false,
                     }),
                 }));
             }

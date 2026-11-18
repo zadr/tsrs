@@ -948,6 +948,23 @@ fn test_match_files_past_the_inline_prefetch() {
     assert_eq!(got, expected);
 }
 
+// The glob hands every listing it read back to the file system (`FS::keep_accessible_entries`), at every depth: a
+// disabled cache keeps them, and still has them after the files are gone.
+#[test]
+fn test_match_files_hands_back_its_listings() {
+    for (depth, listed) in [(UNLIMITED_DEPTH, &["/dev", "/dev/sub", "/dev/sub/deep"][..]), (1, &["/dev"][..])] {
+        let host = from_map([("/dev/a.ts", ""), ("/dev/sub/b.ts", ""), ("/dev/sub/deep/c.ts", "")], true);
+        let cached = tsrs_vfs::cachedvfs::from(&host);
+        cached.disable_and_clear_cache();
+        match_files("/dev", &[".ts"], &[] as &[&str], &["**/*"], true, "/", depth, &cached);
+        host.remove("/dev").unwrap();
+        cached.enable();
+        for dir in listed {
+            assert!(!cached.get_accessible_entries(dir).files.is_empty(), "{dir} at depth {depth}");
+        }
+    }
+}
+
 // TestReadDirectorySymlinkCycle tests that cyclic symlinks don't cause infinite loops.
 // The cycle is detected by the vfs package using Realpath for cycle detection.
 // This means directories with cyclic symlinks will be skipped during traversal.

@@ -121,6 +121,12 @@ impl FS for OsFS {
         os_fs_realpath(path)
     }
 
+    // Not on Windows: its path rules (Win32 name normalization, reparse points) were not checked against
+    // `cachedvfs::listing_answer`.
+    fn exact_listings(&self) -> bool {
+        cfg!(unix)
+    }
+
     fn write_file(&self, path: &str, content: &str) -> Result<(), String> {
         Self::write_file_ensuring_dir(path, content, false)
     }

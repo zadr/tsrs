@@ -519,6 +519,7 @@ impl FS for OverlayFS {
             files: host_entries.files.clone(),
             directories: host_entries.directories.clone(),
             symlinks: host_entries.symlinks,
+            exact: false,
         };
         let use_case_sensitive_file_names = self.use_case_sensitive_file_names();
         let equal_name = |left: &str, right: &str| {

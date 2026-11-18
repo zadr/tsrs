@@ -941,6 +941,7 @@ impl GlobVisitor {
         if depth != UNLIMITED_DEPTH {
             depth -= 1;
             if depth == 0 {
+                host.keep_accessible_entries(absolute_path, entries);
                 return;
             }
         }
@@ -974,6 +975,7 @@ impl GlobVisitor {
                 &child_real_path,
             );
         }
+        host.keep_accessible_entries(absolute_path, entries);
     }
 }
 

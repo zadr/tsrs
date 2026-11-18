@@ -96,7 +96,8 @@ fn probes_past_symlinks_irregular_entries_and_failed_listings_match_the_file_sys
     std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o700)).unwrap();
 }
 
-// Files that appear or disappear after the listing within one run.
+// Files that appear or disappear after the listing within one run are answered as of the listing, as Go's cachedvfs
+// answers a name it has probed once. (Unix only: `os::fs().exact_listings()`.)
 #[test]
 fn probes_after_the_directory_changes() {
     let dir = temp_dir();
@@ -104,8 +105,22 @@ fn probes_after_the_directory_changes() {
     let cached = listed(&[&dir]);
     std::fs::remove_file(format!("{dir}/early.ts")).unwrap();
     std::fs::write(format!("{dir}/late.ts"), "").unwrap();
-    assert!(!cached.file_exists(&format!("{dir}/early.ts")));
-    assert!(cached.file_exists(&format!("{dir}/late.ts")));
+    assert_eq!(cached.file_exists(&format!("{dir}/early.ts")), cfg!(unix));
+    assert_eq!(cached.file_exists(&format!("{dir}/late.ts")), !cfg!(unix));
+}
+
+// A listing handed back while the cache is disabled (config parsing) answers once it is enabled (the program).
+#[test]
+fn kept_listings_answer_once_the_cache_is_enabled() {
+    let dir = temp_dir();
+    std::fs::write(format!("{dir}/a.ts"), "").unwrap();
+    let cached = cachedvfs::from(os::fs());
+    cached.disable_and_clear_cache();
+    cached.keep_accessible_entries(&dir, os::fs().get_accessible_entries(&dir));
+    std::fs::remove_file(format!("{dir}/a.ts")).unwrap();
+    assert!(!cached.file_exists(&format!("{dir}/a.ts")));
+    cached.enable();
+    assert_eq!(cached.file_exists(&format!("{dir}/a.ts")), cfg!(unix));
 }
 
 // What the cache writes, removes or forgets is seen by the next probe.
@@ -125,6 +140,10 @@ fn probes_after_writes_and_clears_match_the_file_system() {
     std::fs::write(format!("{dir}/b.ts"), "").unwrap();
     cached.clear_cache();
     assert_probes_match(&cached, &format!("{dir}/b.ts"));
+    cached.get_accessible_entries(&dir);
+    std::fs::write(format!("{dir}/d.ts"), "").unwrap();
+    cached.clear_listings();
+    assert_probes_match(&cached, &format!("{dir}/d.ts"));
     cached.get_accessible_entries(&dir);
     std::fs::write(format!("{dir}/c.ts"), "").unwrap();
     cached.disable_and_clear_cache();

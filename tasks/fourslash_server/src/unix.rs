@@ -137,6 +137,7 @@ impl FS for RemoteFS {
                 Value::Null => None,
                 names => Some(strings(names).into_iter().collect()),
             },
+            exact: false,
         }
     }
 

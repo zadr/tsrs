@@ -124,6 +124,11 @@ impl<T: FS> FS for WrappedFS<T> {
         self.fs.realpath(path)
     }
 
+    // The listings of embedded directories are not exact.
+    fn exact_listings(&self) -> bool {
+        self.fs.exact_listings()
+    }
+
     fn write_file(&self, path: &str, data: &str) -> Result<(), String> {
         assert!(split_path(path).is_none(), "cannot write to embedded file system");
         self.fs.write_file(path, data)

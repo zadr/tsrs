@@ -77,6 +77,17 @@ impl<K: Hash + Eq, V> SyncMap<K, V> {
     fn initialized_shards(&self) -> impl Iterator<Item = &RwLock<HashTable<(K, V)>>> {
         self.shards.iter().filter_map(OnceLock::get).flat_map(|group| group.iter())
     }
+
+    /// `f` of the value under `key`, in place under the shard's read lock (`load` clones it).
+    pub fn load_with<Q, R>(&self, key: &Q, f: impl FnOnce(&V) -> R) -> Option<R>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let hash = hash_of(key);
+        let m = read(self.shard(hash)?);
+        m.find(hash, |(k, _)| k.borrow() == key).map(|(_, v)| f(v))
+    }
 }
 
 impl<K: Hash + Eq + Clone, V: Clone> SyncMap<K, V> {

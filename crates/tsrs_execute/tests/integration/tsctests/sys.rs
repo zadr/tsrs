@@ -137,6 +137,11 @@ impl FS for TestFs {
     fn realpath(&self, path: &str) -> String {
         self.fs.realpath(path)
     }
+    // MapFS probes agree with its listings, so every build and watch test here also runs with cachedvfs answering
+    // probes from them.
+    fn exact_listings(&self) -> bool {
+        true
+    }
 }
 
 // fsbaselineutil DiffEntry / Snapshot

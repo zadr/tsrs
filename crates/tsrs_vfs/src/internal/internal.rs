@@ -157,8 +157,11 @@ impl<R: RootFor> Common<R> {
             true
         };
 
-        for entry in self.get_entries(path) {
+        let entries = self.get_entries(path);
+        result.exact = entries.is_some();
+        for entry in entries.unwrap_or_default() {
             let entry_type = entry.type_;
+            result.exact &= entry.name.is_ascii();
 
             if add_to_result(&mut result, &mut symlinks, &entry.name, entry_type, false) {
                 continue;
@@ -166,9 +169,10 @@ impl<R: RootFor> Common<R> {
 
             if entry_type.intersects(FileMode::Symlink) {
                 // Easy case; UNIX-like system will clearly mark symlinks.
-                if let Some(stat) = self.stat(&format!("{}/{}", path, entry.name)) {
-                    add_to_result(&mut result, &mut symlinks, &entry.name, stat.mode, true);
-                }
+                let added = self.stat(&format!("{}/{}", path, entry.name)).is_some_and(|stat| {
+                    add_to_result(&mut result, &mut symlinks, &entry.name, stat.mode, true)
+                });
+                result.exact &= added;
                 continue;
             }
 
@@ -180,19 +184,20 @@ impl<R: RootFor> Common<R> {
                 let full_path = format!("{}/{}", path, entry.name);
                 if is_reparse_point(&full_path)
                     && let Some(stat) = self.stat(&full_path)
+                    && add_to_result(&mut result, &mut symlinks, &entry.name, stat.mode, true)
                 {
-                    add_to_result(&mut result, &mut symlinks, &entry.name, stat.mode, true);
+                    continue;
                 }
             }
+            result.exact = false;
         }
 
         result.symlinks = Some(symlinks);
         result
     }
 
-    fn get_entries(&self, path: &str) -> Vec<IoDirEntry> {
-        self.with_root_and_path(path, |fsys, rest| fsys.read_dir(rest).unwrap_or_default())
-            .unwrap_or_default()
+    fn get_entries(&self, path: &str) -> Option<Vec<IoDirEntry>> {
+        self.with_root_and_path(path, |fsys, rest| fsys.read_dir(rest).ok())?
     }
 
     pub fn read_file(&self, path: &str) -> Option<String> {

@@ -320,6 +320,7 @@ impl FS for CallbackFs {
                         files: raw.files.unwrap_or_default(),
                         directories: raw.directories.unwrap_or_default(),
                         symlinks: raw.symlinks.map(|s| s.into_iter().collect()),
+                        exact: false,
                     }
                 }
                 "useOS" => self.base.get_accessible_entries(path),

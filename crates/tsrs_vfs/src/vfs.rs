@@ -39,6 +39,16 @@ pub trait FS: Send + Sync {
     // Realpath returns the "real path" of the specified path,
     // following symlinks and correcting filename casing.
     fn realpath(&self, path: &str) -> String;
+
+    // tsrs-only: whether file_exists and directory_exists of a name agree with an exact listing (`Entries::exact`) of
+    // its directory as far as cachedvfs answers from one (`cachedvfs::listing_answer`).
+    fn exact_listings(&self) -> bool {
+        false
+    }
+
+    // tsrs-only: a listing get_accessible_entries returned, handed back by a caller done with it (the include glob)
+    // for a cache to keep.
+    fn keep_accessible_entries(&self, _path: &str, _entries: Entries) {}
 }
 
 macro_rules! forward_fs {
@@ -81,6 +91,12 @@ macro_rules! forward_fs {
         fn realpath(&self, path: &str) -> String {
             (**self).realpath(path)
         }
+        fn exact_listings(&self) -> bool {
+            (**self).exact_listings()
+        }
+        fn keep_accessible_entries(&self, path: &str, entries: Entries) {
+            (**self).keep_accessible_entries(path, entries)
+        }
     };
 }
 
@@ -106,6 +122,9 @@ pub struct Entries {
     // None means symlink information is not available and the entries may need
     // to be re-checked for symlinks.
     pub symlinks: Option<FxHashSet<String>>,
+    // tsrs-only: the directory was read, every entry of it is in Files or Directories (none was an irregular file
+    // or a broken symlink), and every name is ASCII.
+    pub exact: bool,
 }
 
 bitflags! {
