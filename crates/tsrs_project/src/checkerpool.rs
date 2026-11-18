@@ -9,7 +9,7 @@ use tsrs_compiler::{
 use tsrs_core::arena::{Region, RegionScope};
 use tsrs_core::context::{CheckerLifetime, Context, get_checker_lifetime, get_request_id};
 
-use crate::memregions::{ProgramOwner, log_region};
+use crate::memregions::{ProgramOwner, log_region, return_freed_memory_when_quiet};
 use tsrs_core::P;
 
 use crate::background::{Timer, after_func};
@@ -381,6 +381,7 @@ impl CheckerPoolImpl {
             )
         });
         drop(instance);
+        return_freed_memory_when_quiet();
     }
 
     pub(crate) fn set_owner(&self, owner: Weak<ProgramOwner>) {

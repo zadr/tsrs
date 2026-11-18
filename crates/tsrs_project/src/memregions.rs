@@ -13,11 +13,13 @@
 // live as long as a snapshot or a language service refers to them), so it is dropped exactly when nothing can reach
 // the program any more. Dropping it frees the checkers and their regions, the `Program` itself, then the regions.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use tsrs_compiler::Program;
 use tsrs_core::arena::Region;
 
+use crate::background::{Timer, after_func};
 use crate::checkerpool::CheckerPoolImpl;
 
 pub struct ProgramOwner {
@@ -86,6 +88,26 @@ impl Drop for ProgramOwner {
         // SAFETY: the last project value referring to the program is being dropped: no snapshot, language service or
         // held checker can reach it (see the file comment).
         unsafe { tsrs_compiler::free_program(self.program) };
+        return_freed_memory_when_quiet();
+    }
+}
+
+/// Programs and checkers freed less than this long ago may be followed by more (an edit frees the program it
+/// replaces), so the freed memory goes back once they stop.
+const QUIET: Duration = Duration::from_secs(2);
+
+/// tsrs-only (Go's GC returns memory by itself): gives the freed memory back (`tsrs_compiler::return_freed_memory`)
+/// once nothing was freed for `QUIET`, on a background worker, so that no request waits for it. mimalloc has no purge
+/// timer: what an idle server freed stayed resident.
+pub fn return_freed_memory_when_quiet() {
+    static TIMER: OnceLock<Timer> = OnceLock::new();
+    match TIMER.get() {
+        Some(timer) => {
+            timer.reset(QUIET);
+        }
+        None => {
+            TIMER.get_or_init(|| after_func(QUIET, tsrs_compiler::return_freed_memory));
+        }
     }
 }
 

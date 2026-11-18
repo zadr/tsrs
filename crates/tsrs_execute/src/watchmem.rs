@@ -120,24 +120,10 @@ impl Freer {
         })
     }
 
-    /// tsrs-only: once the frees queued so far are done, after each cycle (and the first build):
-    /// - macOS: the allocator gives its freed memory back (`mi_collect(true)`), on every worker-pool thread and here.
-    ///   mimalloc keeps much of what a cycle freed resident there (after a few full rebuilds of vscode, its
-    ///   heap stood ~1 GB above the initial build), and purging at once on every free slows the cycles
-    ///   themselves (`MIMALLOC_PURGE_DELAY=0`: the hub edit 1.3 -> 2.0 s). The pool's threads matter as much
-    ///   as this one: what they allocated during the cycle is freed here, from another thread, and such a
-    ///   block stays allocated in its page (unpurgeable) until the owning thread collects
-    ///   (notes/watch-macos.md, "memory").
-    /// - The arena's cached slabs give their pages back (`arena::release_cached_slab_pages`).
+    /// tsrs-only: once the frees queued so far are done, after each cycle (and the first build), gives the freed
+    /// memory back (`tsrs_compiler::return_freed_memory`).
     pub(crate) fn after_cycle(&self) {
-        self.run(|| {
-            #[cfg(target_os = "macos")]
-            {
-                tsrs_compiler::worker_pool().broadcast(|_| tsrs_core::memsplit::heap_collect(true));
-                tsrs_core::memsplit::heap_collect(true);
-            }
-            tsrs_core::arena::release_cached_slab_pages();
-        });
+        self.run(tsrs_compiler::return_freed_memory);
     }
 
     pub(crate) fn run(&self, job: impl FnOnce() + Send + 'static) {

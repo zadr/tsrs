@@ -514,6 +514,26 @@ pub fn worker_pool() -> &'static rayon::ThreadPool {
     })
 }
 
+/// Gives back to the system what the process freed so far.
+///
+/// tsrs-only (Go's GC returns memory by itself), for a long-lived process after it freed a program: the watch after
+/// each cycle, the language server once it stops freeing.
+/// - macOS: the allocator gives its freed memory back (`mi_collect(true)`), on every worker-pool thread and here.
+///   mimalloc keeps much of what a cycle freed resident there (it has no purge timer; after a few full rebuilds of
+///   vscode, its heap stood ~1 GB above the initial build), and purging at once on every free slows the cycles
+///   themselves (`MIMALLOC_PURGE_DELAY=0`: the hub edit 1.3 -> 2.0 s). The pool's threads matter as much as this
+///   one: a block one of them allocated and another thread freed stays allocated in its page (unpurgeable) until the
+///   owning thread collects (notes/watch-macos.md, "memory").
+/// - The arena's cached slabs give their pages back (`arena::release_cached_slab_pages`).
+pub fn return_freed_memory() {
+    #[cfg(target_os = "macos")]
+    {
+        worker_pool().broadcast(|_| tsrs_core::memsplit::heap_collect(true));
+        tsrs_core::memsplit::heap_collect(true);
+    }
+    tsrs_core::arena::release_cached_slab_pages();
+}
+
 // program.go:305
 pub fn new_program(opts: ProgramOptions) -> &'static Program {
     let single_threaded = tsrs_core::NO_THREADS
