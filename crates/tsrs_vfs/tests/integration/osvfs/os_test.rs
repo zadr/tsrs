@@ -156,6 +156,132 @@ fn test_os_bom_and_directories() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+// Letters that differ between nearby offsets, so a misplaced chunk shows.
+fn letters(len: usize) -> Vec<u8> {
+    (0..len)
+        .map(|i| b'a' + ((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 59) as u8 % 26)
+        .collect()
+}
+
+// Around std::fs::read's 32-byte end-of-file probe, the page size and its 8 KiB read granule.
+const READ_SIZES: [usize; 10] = [0, 1, 31, 32, 33, 4095, 4096, 4097, 8192, (1 << 20) + 1];
+
+#[test]
+fn test_os_read_file_sizes() {
+    let dir = temp_dir();
+    for size in READ_SIZES {
+        let path = format!("{dir}/{size}.ts");
+        std::fs::write(&path, letters(size)).unwrap();
+        let want = String::from_utf8(letters(size)).unwrap();
+        assert_eq!(fs().read_file(&path), Some(want), "size {size}");
+    }
+    assert_eq!(fs().read_file(&format!("{dir}/missing.ts")), None);
+    assert_eq!(fs().read_file(&dir), None);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn test_os_read_file_encodings() {
+    let dir = temp_dir();
+    for (name, content, want) in [
+        ("invalid.ts", &b"a\xC3(b\x80"[..], "a\u{FFFD}(b\u{FFFD}"),
+        ("utf8_bom.ts", b"\xEF\xBB\xBFhello", "hello"),
+        ("bom_only.ts", b"\xEF\xBB\xBF", ""),
+        ("utf16le.ts", b"\xFF\xFEh\0i\0", "hi"),
+        ("utf16be.ts", b"\xFE\xFF\0h\0i", "hi"),
+    ] {
+        let path = format!("{dir}/{name}");
+        std::fs::write(&path, content).unwrap();
+        assert_eq!(fs().read_file(&path).as_deref(), Some(want), "{name}");
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+// Writes `content` into the FIFO at `path` from another thread while `read` reads it.
+#[cfg(unix)]
+fn read_fifo<T>(path: &str, content: &[u8], read: impl FnOnce(&str) -> T) -> T {
+    let writer = std::thread::spawn({
+        let (path, content) = (path.to_string(), content.to_vec());
+        move || std::fs::write(path, content).unwrap()
+    });
+    let got = read(path);
+    writer.join().unwrap();
+    got
+}
+
+#[cfg(unix)]
+#[test]
+fn test_os_read_file_fifo() {
+    let dir = temp_dir();
+    let path = format!("{dir}/pipe.ts");
+    let c_path = std::ffi::CString::new(path.as_str()).unwrap();
+    // SAFETY: c_path is NUL-terminated and outlives the call.
+    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+    // Past the 64 KiB pipe buffer, so the reader sees several short reads.
+    let content = letters(200_000);
+    let got = read_fifo(&path, &content, |path| fs().read_file(path));
+    assert_eq!(got, Some(String::from_utf8(content.clone()).unwrap()));
+    assert_eq!(read_fifo(&path, &content, |path| os_read_file(path).unwrap()), content);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn test_os_read_file_matches_std() {
+    let dir = temp_dir();
+    for size in READ_SIZES {
+        let path = format!("{dir}/{size}.ts");
+        std::fs::write(&path, letters(size)).unwrap();
+        assert_eq!(os_read_file(&path).unwrap(), std::fs::read(&path).unwrap(), "size {size}");
+    }
+    for path in [dir.clone(), format!("{dir}/missing.ts")] {
+        let (got, want) = (os_read_file(&path).unwrap_err(), std::fs::read(&path).unwrap_err());
+        assert_eq!((got.kind(), got.to_string()), (want.kind(), want.to_string()), "{path}");
+    }
+    if cfg!(unix) {
+        assert_eq!(os_read_file("/dev/null").unwrap(), b"");
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+// The file grows or shrinks between fstat and the read: `size` is stale.
+#[cfg(unix)]
+#[test]
+fn test_read_regular_file_stale_size() {
+    let dir = temp_dir();
+    let path = format!("{dir}/a.ts");
+    let mib = 1 << 20;
+    for (size, actual) in [
+        (0, 0),
+        (33, 33),
+        (0, 1),
+        (0, 32),
+        (0, 33),
+        (0, 5000),
+        (1, 2),
+        (1, 33),
+        (1, 34),
+        (32, 64),
+        (32, 65),
+        (4096, 4097),
+        (4096, 4096 + 32),
+        (4096, 4096 + 33),
+        (4096, 8192 + 33),
+        (4096, mib + 1),
+        (mib + 1, 3 * mib),
+        (1, 0),
+        (100, 0),
+        (100, 1),
+        (100, 99),
+        (4097, 4096),
+        (mib + 1, 33),
+    ] {
+        std::fs::write(&path, letters(actual)).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        assert_eq!(read_regular_file(&file, size).unwrap(), letters(actual), "{size} -> {actual}");
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[test]
 fn test_clean() {
     for (input, want) in [

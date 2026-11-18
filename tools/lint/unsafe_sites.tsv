@@ -465,6 +465,8 @@ crates/tsrs_testrunner/src/compile.rs	create_program_like	leak	ownership	#2	keep
 crates/tsrs_testrunner/src/options.rs	new_option	leak	ownership		keep	test runner, bench or wasm one-shot; process lifetime
 crates/tsrs_testrunner/src/types_dump.rs	run	leak	ownership		keep	test runner, bench or wasm one-shot; process lifetime
 crates/tsrs_vfs/src/internal/internal.rs	decode_bytes	block	logic	simdutf8 validated every byte, and s has not been modified since validation.	keep	from_utf8_unchecked after validation, or deliberate WTF-8
+crates/tsrs_vfs/src/osvfs/os.rs	read_some	block	boundary	readv filled the iovecs in order, so it initialized the first min(n, len) spare bytes.	keep	readv into Vec spare capacity; safe read_vectored needs a zero-filled buffer
+crates/tsrs_vfs/src/osvfs/os.rs	read_some	block	boundary	the iovecs cover `len` bytes of the Vec's spare capacity and the probe array, both writable and	keep	readv into Vec spare capacity; safe read_vectored needs a zero-filled buffer
 crates/tsrs_wasm/src/host.rs	(file)	extern	boundary		keep	OS, FFI or allocator call
 crates/tsrs_wasm/src/host.rs	call	block	boundary	the host reads `arg.len()` bytes at `arg.as_ptr()` during the call and keeps no reference to them.	keep	OS, FFI or allocator call
 crates/tsrs_wasm/src/host.rs	call	block	boundary	the host staged exactly `n` bytes for this call; `fs_take` copies them into `out`, which has `n` bytes.	keep	OS, FFI or allocator call

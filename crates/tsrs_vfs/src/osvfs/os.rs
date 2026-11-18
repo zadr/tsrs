@@ -766,8 +766,97 @@ impl IoFS for DirFS<'_> {
 
     fn read_file(&self, name: &str) -> Result<Vec<u8>, FsError> {
         let full = self.join(name)?;
-        fs::read(&full).map_err(io_error)
+        os_read_file(&full).map_err(io_error)
     }
+}
+
+/// `fs::read` without its end-of-file probe read on regular files.
+#[cfg(unix)]
+pub fn os_read_file(path: &str) -> io::Result<Vec<u8>> {
+    let file = fs::File::open(path)?;
+    let metadata = file.metadata().ok();
+    let size = metadata.as_ref().map_or(0, |md| md.len() as usize);
+    if metadata.is_some_and(|md| md.is_file()) {
+        return read_regular_file(&file, size);
+    }
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(size)?;
+    read_to_end(&file, &mut buf)?;
+    Ok(buf)
+}
+
+#[cfg(not(unix))]
+pub fn os_read_file(path: &str) -> io::Result<Vec<u8>> {
+    fs::read(path)
+}
+
+/// Reads a regular file to its end, given the size an earlier fstat reported for it.
+#[cfg(unix)]
+pub fn read_regular_file(file: &fs::File, size: usize) -> io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(size)?;
+    let n = read_some(file, &mut buf)?;
+    // fs::read spends a second read, an empty 32-byte probe, on finding end of file: 4-11% of a check's syscalls.
+    // A regular file reads short only at its end, so `size` bytes where more were asked for is all of it. Below
+    // 1 GiB no kernel's per-read cap (Linux MAX_RW_COUNT, about 2 GiB) can be what cut the read short.
+    if n == 0 || (n == size && size < 1 << 30) {
+        return Ok(buf);
+    }
+    read_to_end(file, &mut buf)?;
+    Ok(buf)
+}
+
+#[cfg(unix)]
+fn read_to_end(file: &fs::File, buf: &mut Vec<u8>) -> io::Result<()> {
+    let start_capacity = buf.capacity();
+    loop {
+        // fs::read's growth: a buffer full at its starting size takes a bare probe read, any other full buffer grows.
+        // Every read then asks for at least what fs::read's would.
+        if buf.len() == buf.capacity() && buf.capacity() != start_capacity {
+            buf.try_reserve(PROBE_SIZE)?;
+        }
+        if read_some(file, buf)? == 0 {
+            return Ok(());
+        }
+    }
+}
+
+// std's bound on one read; macOS fails a read of more than INT_MAX bytes.
+#[cfg(unix)]
+const READ_LIMIT: usize = i32::MAX as usize - 1;
+
+// fs::read's end-of-file probe.
+#[cfg(unix)]
+const PROBE_SIZE: usize = 32;
+
+/// One `readv` into `buf`'s spare capacity and then a probe, appending what it read.
+#[cfg(unix)]
+fn read_some(file: &fs::File, buf: &mut Vec<u8>) -> io::Result<usize> {
+    use std::os::fd::AsRawFd;
+
+    let mut probe = [0u8; PROBE_SIZE];
+    let spare = buf.spare_capacity_mut();
+    let len = spare.len().min(READ_LIMIT - probe.len());
+    let iov = [
+        libc::iovec { iov_base: spare.as_mut_ptr().cast(), iov_len: len },
+        libc::iovec { iov_base: probe.as_mut_ptr().cast(), iov_len: probe.len() },
+    ];
+    let n = loop {
+        // SAFETY: the iovecs cover `len` bytes of the Vec's spare capacity and the probe array, both writable and
+        // alive until the call returns.
+        let n = unsafe { libc::readv(file.as_raw_fd(), iov.as_ptr(), 2) };
+        if let Ok(n) = usize::try_from(n) {
+            break n;
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    };
+    // SAFETY: readv filled the iovecs in order, so it initialized the first min(n, len) spare bytes.
+    unsafe { buf.set_len(buf.len() + n.min(len)) };
+    buf.extend_from_slice(&probe[..n.saturating_sub(len)]);
+    Ok(n)
 }
 
 #[cfg(target_os = "linux")]
