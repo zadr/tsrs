@@ -1,10 +1,12 @@
 // Port of execute/incremental/buildinfotosnapshot.go.
 
 use std::sync::Arc;
+
+use rustc_hash::FxHashMap;
 use tsrs_ast::RepopulateDiagnosticInfo;
 use tsrs_compiler::CompilerHost;
 use tsrs_core::P;
-use tsrs_core::collections::new_set_with_size_hint;
+use tsrs_core::collections::{Set, new_set_with_size_hint};
 use tsrs_core::tspath::{self, Path};
 use tsrs_tsoptions::ParsedCommandLine;
 
@@ -49,15 +51,7 @@ pub fn build_info_to_snapshot(
             )
         })
         .collect();
-    to.file_path_set = build_info
-        .file_ids_list
-        .iter()
-        .map(|file_id_list| {
-            let mut file_set = new_set_with_size_hint(file_id_list.len());
-            file_set.m.extend(file_id_list.iter().map(|&file_id| to.to_file_path(file_id)));
-            std::sync::Arc::new(RefSet::flat(file_set))
-        })
-        .collect();
+    to.file_path_set = to.file_path_sets();
     to.set_compiler_options();
     to.set_file_info_and_emit_signatures();
     to.snapshot.file_order = to.file_paths[..build_info.file_infos.len()].to_vec();
@@ -105,6 +99,79 @@ impl ToSnapshot<'_> {
     // buildinfotosnapshot.go:66
     fn to_file_path(&self, file_id: BuildInfoFileId) -> Path {
         self.file_paths[file_id as usize - 1].clone()
+    }
+
+    // The sets of `file_ids_list`. Each file's list repeats the files declaring ambient modules (vscode: 1,963,498
+    // paths in 50.2 MB of sets, against 3.8 MB for the same references built from the program), so the paths that
+    // every list but at most one has are kept once and shared, as `programtosnapshot` shares a checker's ambient
+    // module files (`RefSet::split`); a list without two or more of them stays flat. Every set has its list's paths.
+    fn file_path_sets(&self) -> Vec<Arc<RefSet>> {
+        let lists = &self.build_info.file_ids_list;
+        // Ids by path (two names of one path count once): the id of the path's first name.
+        let mut first_id: FxHashMap<&Path, BuildInfoFileId> = FxHashMap::default();
+        let canonical: Vec<BuildInfoFileId> = std::iter::once(0)
+            .chain(
+                self.file_paths
+                    .iter()
+                    .zip(1..)
+                    .map(|(path, id)| *first_id.entry(path).or_insert(id)),
+            )
+            .collect();
+        let canonical_of = |file_id: BuildInfoFileId| {
+            canonical.get(file_id as usize).copied().filter(|&id| id != 0)
+        };
+        // `seen[id]` is the 1-based index of the last list that had `id`.
+        let mut seen = vec![0usize; canonical.len()];
+        let mut lists_with = vec![0usize; canonical.len()];
+        for (list, file_ids) in (1..).zip(lists) {
+            for id in file_ids.iter().filter_map(|&file_id| canonical_of(file_id)) {
+                if seen[id as usize] != list {
+                    seen[id as usize] = list;
+                    lists_with[id as usize] += 1;
+                }
+            }
+        }
+        let is_shared: Vec<bool> =
+            lists_with.iter().map(|&n| n > 0 && n + 1 >= lists.len()).collect();
+        let shared_ids: Vec<BuildInfoFileId> =
+            (0..).zip(&is_shared).filter(|&(_, &shared)| shared).map(|(id, _)| id).collect();
+        let mut shared = new_set_with_size_hint(shared_ids.len());
+        shared.m.extend(shared_ids.iter().map(|&id| self.to_file_path(id)));
+        let shared = Arc::new(shared);
+        let shared_id_sum: u64 = shared_ids.iter().map(|&id| u64::from(id)).sum();
+        seen.fill(0);
+        (1..)
+            .zip(lists)
+            .map(|(list, file_ids)| {
+                let mut own = Set::default();
+                let (mut in_shared, mut in_shared_sum) = (0, 0u64);
+                for &file_id in file_ids {
+                    match canonical_of(file_id) {
+                        Some(id) if is_shared[id as usize] => {
+                            if seen[id as usize] != list {
+                                seen[id as usize] = list;
+                                in_shared += 1;
+                                in_shared_sum += u64::from(id);
+                            }
+                        }
+                        _ => {
+                            own.add(self.to_file_path(file_id));
+                        }
+                    }
+                }
+                let missing = shared_ids.len() - in_shared;
+                Arc::new(if in_shared == 0 || missing > 1 {
+                    own.m.extend(file_ids.iter().map(|&file_id| self.to_file_path(file_id)));
+                    RefSet::flat(own)
+                } else {
+                    // The sum of the shared ids less the list's is the one id the list does not have.
+                    let skip = (missing == 1).then(|| {
+                        self.to_file_path((shared_id_sum - in_shared_sum) as BuildInfoFileId)
+                    });
+                    RefSet::split(own, Arc::clone(&shared), skip)
+                })
+            })
+            .collect()
     }
 
     // buildinfotosnapshot.go:70
