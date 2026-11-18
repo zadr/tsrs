@@ -9,8 +9,8 @@
 use rustc_hash::FxHashMap;
 
 use super::{
-    LATE_EVENT_WRITE, REMOVE_UNTYPED_DIRECTORY, Scenario, ScenarioEdit, ScenarioFile, ScenarioOp,
-    run_scenario,
+    LATE_EVENT_WRITE, OVERFLOW, REMOVE_UNTYPED_DIRECTORY, Scenario, ScenarioEdit, ScenarioFile,
+    ScenarioOp, WRITE_SAME_TIME, run_scenario,
 };
 
 const LIB_FILE: &str = "/home/src/tslibs/TS/Lib/lib.esnext.full.d.ts";
@@ -509,12 +509,62 @@ fn deleting_a_file_the_build_cannot_read_runs_no_cycle() {
             ),
             ("extended config", vec![delete("app/base.json")], Cycle::Runs),
         ],
-        false,
-        true,
+        Harness { file_events_only: true, ..Harness::default() },
     );
     for code in ["TS2322", "TS2307", "TS5083"] {
         assert!(baseline.contains(code), "the scenario reports {code}\n{baseline}");
     }
+}
+
+// After an overflow the watch builds the program again without the lost events. It parses again the files whose
+// modification time changed, and those read within two seconds of it (a later write in the same unit of time keeps
+// it), not the others.
+#[test]
+fn an_overflow_rebuild_reads_again_only_files_that_may_have_changed() {
+    let baseline = run_expecting(
+        "overflow",
+        &["-w", "-p", "app"],
+        vec![
+            file(
+                &format!("{ROOT}/app/tsconfig.json"),
+                r#"{ "compilerOptions": { "target": "esnext", "noEmit": true } }"#,
+            ),
+            file(&format!("{ROOT}/app/a.ts"), "export const a: number = 1;\n"),
+            file(
+                &format!("{ROOT}/app/b.ts"),
+                "import { a } from \"./a\";\nexport const b: number = a;\n",
+            ),
+            file(&format!("{ROOT}/app/c.ts"), "export const c = 1;\n"),
+        ],
+        vec![
+            ("c.ts saved", vec![write("app/c.ts", "export const c: number = 's';\n")], Cycle::Runs),
+            (
+                "events lost: a.ts saved, c.ts saved again in the same second",
+                vec![
+                    write("app/a.ts", "export const a: string = 's';\n"),
+                    write_same_time("app/c.ts", "export const c: number = 2;\n"),
+                    overflow(),
+                ],
+                Cycle::Runs,
+            ),
+        ],
+        Harness { report_reads: true, ..Harness::default() },
+    );
+    let overflow_cycle = &baseline[baseline.find("\nEdit [1]").unwrap()..];
+    let reads: Vec<&str> = overflow_cycle
+        .lines()
+        .skip_while(|line| *line != "Files read::")
+        .skip(1)
+        .map_while(|line| line.strip_prefix("  "))
+        .collect();
+    for (file, read) in [("a.ts", true), ("b.ts", false), ("c.ts", true)] {
+        assert_eq!(
+            reads.contains(&format!("{ROOT}/app/{file}").as_str()),
+            read,
+            "{file}\n{baseline}"
+        );
+    }
+    assert!(overflow_cycle.contains("TS2322"), "{baseline}");
 }
 
 // Runs `tsgo <args>` on `files` (paths under ROOT), asserts that no edit differs from a fresh build, and returns the
@@ -551,7 +601,15 @@ fn run_with(
         .collect();
     let files: Vec<ScenarioFile> =
         files.iter().map(|(path, content)| file(&format!("{ROOT}/{path}"), content)).collect();
-    run_expecting(name, args, files, edits, signature_job, false)
+    run_expecting(name, args, files, edits, Harness { signature_job, ..Harness::default() })
+}
+
+// What the harness does besides replaying the edits (`Scenario`).
+#[derive(Clone, Copy, Default)]
+struct Harness {
+    signature_job: bool,
+    file_events_only: bool,
+    report_reads: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -569,8 +627,7 @@ fn run_expecting(
     args: &[&str],
     mut files: Vec<ScenarioFile>,
     edits: Vec<(&str, Vec<ScenarioOp>, Cycle)>,
-    signature_job: bool,
-    file_events_only: bool,
+    harness: Harness,
 ) -> String {
     files.push(file(LIB_FILE, LIB));
     let mut all_ops: Vec<ScenarioOp> = Vec::new();
@@ -605,8 +662,9 @@ fn run_expecting(
         files,
         default_libs: vec![LIB_FILE.to_string()],
         edits,
-        signature_job,
-        file_events_only,
+        signature_job: harness.signature_job,
+        file_events_only: harness.file_events_only,
+        report_reads: harness.report_reads,
     };
     let baseline = run_scenario(&test);
     let diffs = baseline.matches("\nDiff:: ").count();
@@ -654,6 +712,24 @@ fn write(path: &str, content: &str) -> ScenarioOp {
         op: "write".to_string(),
         path: format!("{ROOT}/{path}"),
         content: content.to_string(),
+        target: String::new(),
+    }
+}
+
+fn write_same_time(path: &str, content: &str) -> ScenarioOp {
+    ScenarioOp {
+        op: WRITE_SAME_TIME.to_string(),
+        path: format!("{ROOT}/{path}"),
+        content: content.to_string(),
+        target: String::new(),
+    }
+}
+
+fn overflow() -> ScenarioOp {
+    ScenarioOp {
+        op: OVERFLOW.to_string(),
+        path: String::new(),
+        content: String::new(),
         target: String::new(),
     }
 }

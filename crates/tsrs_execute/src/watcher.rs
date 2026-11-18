@@ -5,7 +5,7 @@
 // old one's diagnostics and signatures, so only affected files are checked again.
 
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use tsrs_ast::{SourceFile, SourceFileParseOptions, new_compiler_diagnostic};
@@ -31,7 +31,13 @@ use crate::watchmem::{FileRegions, Freer};
 struct CachedSourceFile {
     file: P<SourceFile>,
     mod_time: Option<SystemTime>,
+    // tsrs-only: read within `SAME_TIME_WINDOW` of its modification time, so a later write may have kept that time.
+    racy: bool,
 }
+
+// A file system stores modification times in units of up to two seconds (FAT): two writes in one unit leave the same
+// time.
+const SAME_TIME_WINDOW: Duration = Duration::from_secs(2);
 
 type SourceFileCache = Arc<SyncMap<Path, CachedSourceFile>>;
 
@@ -39,6 +45,8 @@ type SourceFileCache = Arc<SyncMap<Path, CachedSourceFile>>;
 struct WatchCompilerHost {
     inner: Arc<dyn CompilerHost>,
     cache: SourceFileCache,
+    // tsrs-only: no file of the build is read before this time.
+    build_start: SystemTime,
     // tsrs-only: each parsed file gets a region of its own (watchmem.rs).
     regions: Arc<FileRegions>,
 }
@@ -70,7 +78,13 @@ impl CompilerHost for WatchCompilerHost {
         match file {
             Some(file) => {
                 if let Some(info) = info {
-                    self.cache.store(path, CachedSourceFile { file, mod_time: info.mod_time() });
+                    let mod_time = info.mod_time();
+                    let racy = mod_time.is_some_and(|m| {
+                        self.build_start
+                            .duration_since(m)
+                            .map_or(true, |age| age < SAME_TIME_WINDOW)
+                    });
+                    self.cache.store(path, CachedSourceFile { file, mod_time, racy });
                 }
             }
             None => self.cache.delete(&path),
@@ -276,12 +290,13 @@ impl Watcher {
         if self.testing.is_none() {
             wm.ensure_default_backend(&mut state);
         }
+        let build_start = self.sys.now_time();
         (self.report_watch_status)(new_compiler_diagnostic(
             &diagnostics::STARTING_COMPILATION_IN_WATCH_MODE,
             &[],
         ));
         self.watch_set_dirty = true;
-        if self.do_build(&mut state).is_err() {
+        if self.do_build(&mut state, build_start).is_err() {
             wm.force_overflow();
         }
         if self.testing.is_none() {
@@ -565,10 +580,12 @@ impl Watcher {
                 return;
             }
         } else if overflow {
-            // Overflow: evict the entire source file cache and force a full rebuild. The fast path must not run here:
-            // after clearing the cache a one-file program would present exactly one cache miss and be misread as a
-            // single-file content edit, silently reusing a stale program instead of rediscovering the file graph.
-            self.source_file_cache = Arc::default();
+            // Overflow: force a full rebuild, which rediscovers the file graph; the single-file fast path would reuse a
+            // stale program. tsrs-only: Go also empties the source file cache, so the rebuild parses every file again
+            // (vscode: 130k unix syscalls against 71k with the cache kept). The rebuild rereads each cached file whose
+            // modification time changed (`WatchCompilerHost`), as every full build does; a racy one may have been
+            // written again without changing it, so it is read again too.
+            self.evict_racy_source_files();
             self.watch_set_dirty = true;
             self.force_full_rebuild = true;
         } else if !has_events && !self.config_modified {
@@ -585,13 +602,14 @@ impl Watcher {
         // above leaves it running. Most such cycles are the events of the last build's own outputs, which come while
         // the job runs, and stopping it there left the placeholders until the next build.
         self.stop_signature_job();
+        let build_start = self.sys.now_time();
         self.report_status(|| {
             new_compiler_diagnostic(
                 &diagnostics::FILE_CHANGE_DETECTED_STARTING_INCREMENTAL_COMPILATION,
                 &[],
             )
         });
-        if self.do_build(&mut state).is_err() {
+        if self.do_build(&mut state, build_start).is_err() {
             // Mid-cycle watch failure; force a full rebuild on the next event
             wm.force_overflow();
         }
@@ -726,7 +744,12 @@ impl Watcher {
             || watchmanager::is_in_node_modules(p)
     }
 
-    fn do_build(&mut self, state: &mut WatchState) -> Result<(), tsrs_fswatch::Error> {
+    // `build_start`: a time before the build reads any file.
+    fn do_build(
+        &mut self,
+        state: &mut WatchState,
+        build_start: SystemTime,
+    ) -> Result<(), tsrs_fswatch::Error> {
         if self.config_modified {
             self.source_file_cache = Arc::default();
             self.watch_set_dirty = true;
@@ -760,6 +783,7 @@ impl Watcher {
             let host: Arc<dyn CompilerHost> = Arc::new(WatchCompilerHost {
                 inner: inner_host,
                 cache: Arc::clone(&self.source_file_cache),
+                build_start,
                 regions: Arc::clone(&self.file_regions),
             });
             if self.try_update_program(host) {
@@ -785,6 +809,7 @@ impl Watcher {
         let host: Arc<dyn CompilerHost> = Arc::new(WatchCompilerHost {
             inner: inner_host,
             cache: Arc::clone(&self.source_file_cache),
+            build_start,
             regions: Arc::clone(&self.file_regions),
         });
 
@@ -1074,6 +1099,19 @@ impl Watcher {
             live.insert(f.addr());
         });
         live
+    }
+
+    fn evict_racy_source_files(&self) {
+        let mut racy: Vec<Path> = Vec::new();
+        self.source_file_cache.range(|path, cached| {
+            if cached.racy {
+                racy.push(path.clone());
+            }
+            true
+        });
+        for path in racy {
+            self.source_file_cache.delete(&path);
+        }
     }
 
     fn evict_changed_source_files(&self, changed_paths: &FxHashMap<String, Change>) {

@@ -71,6 +71,8 @@ struct Scenario {
     // tsrs-only: the watch backend reports each changed path alone, as FSEvents and recursive watches do (Go's mock
     // also reports its parent directories).
     file_events_only: bool,
+    // tsrs-only: the baseline lists the files each cycle read.
+    report_reads: bool,
 }
 
 fn s(v: Option<&Value>) -> String {
@@ -159,6 +161,7 @@ fn load_scenario(path: &FsPath) -> Scenario {
         edits,
         signature_job: false,
         file_events_only: false,
+        report_reads: false,
     }
 }
 
@@ -229,12 +232,24 @@ pub const LATE_EVENT_WRITE: &str = "writeLateEvent";
 /// rename out of the watched tree, reported with merged flags).
 pub const REMOVE_UNTYPED_DIRECTORY: &str = "removeUntypedDirectory";
 
+/// tsrs-only: the watch backend drops the events of the edit and reports an overflow.
+pub const OVERFLOW: &str = "overflow";
+
+/// tsrs-only: a write that keeps the file's modification time, as a second write in the same unit of time does.
+pub const WRITE_SAME_TIME: &str = "writeSameTime";
+
 fn apply_ops(sys: &TestSys, ops: &[ScenarioOp]) {
     let fs = sys.fs_from_file_map();
     for op in ops {
         match op.op.as_str() {
             "write" | LATE_EVENT_WRITE => fs.write_file(&op.path, &op.content).unwrap(),
             "delete" | REMOVE_UNTYPED_DIRECTORY => fs.remove(&op.path).unwrap(),
+            OVERFLOW => {}
+            WRITE_SAME_TIME => {
+                let mod_time = fs.stat(&op.path).and_then(|info| info.mod_time()).unwrap();
+                fs.write_file(&op.path, &op.content).unwrap();
+                fs.chtimes(&op.path, mod_time, mod_time).unwrap();
+            }
             "symlink" => {
                 let dir = tspath::get_directory_path(&op.path);
                 let _ = sys.map_fs().mkdir_all(
@@ -388,11 +403,23 @@ fn run_scenario(test: &Scenario) -> String {
                 execute_command(sys, &mut baseline, &args);
             }
             Some(watcher) => {
-                sys.mock_watch_backend
-                    .get()
-                    .unwrap()
-                    .send_changed_paths(&changed_paths, !test.file_events_only);
+                let backend = sys.mock_watch_backend.get().unwrap();
+                if edit.ops.iter().any(|op| op.op == OVERFLOW) {
+                    backend.send_overflow();
+                } else {
+                    backend.send_changed_paths(&changed_paths, !test.file_events_only);
+                }
+                sys.fs.reads.lock().unwrap().clear();
                 watcher.do_cycle();
+                if test.report_reads {
+                    let mut reads = std::mem::take(&mut *sys.fs.reads.lock().unwrap());
+                    reads.sort();
+                    reads.dedup();
+                    baseline.push_str("Files read::\n");
+                    for path in reads {
+                        writeln!(baseline, "  {path}").unwrap();
+                    }
+                }
             }
         }
         sys.serialize_state(&mut baseline);

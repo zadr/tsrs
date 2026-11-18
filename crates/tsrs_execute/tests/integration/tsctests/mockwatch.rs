@@ -102,8 +102,7 @@ impl MockWatchBackend {
     }
 
     /// Go `SendOverflow`.
-    #[expect(dead_code, reason = "Go's mock API; the replayed scenarios do not overflow")]
-    fn send_overflow(&self) {
+    pub(crate) fn send_overflow(&self) {
         let callbacks: Vec<WatchCallback> = self
             .dirs
             .lock()
@@ -113,7 +112,7 @@ impl MockWatchBackend {
             .map(|w| Arc::clone(&w.callback))
             .collect();
         for callback in callbacks {
-            callback(Vec::new(), Some(Error::wrap("overflow", &Error::new(ERR_OVERFLOW.0))));
+            callback(Vec::new(), Some(Error::wrap("overflow", &Error::from(ERR_OVERFLOW))));
         }
     }
 

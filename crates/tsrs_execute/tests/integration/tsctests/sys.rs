@@ -53,6 +53,8 @@ pub struct TestFs {
     fs: Arc<IoVFS<MapFS>>,
     default_libs: Mutex<Option<FxHashSet<String>>>,
     pub(crate) written_files: Mutex<FxHashSet<String>>,
+    // tsrs-only: the files read, for `Scenario::report_reads`.
+    pub(crate) reads: Mutex<Vec<String>>,
 }
 
 impl TestFs {
@@ -108,6 +110,7 @@ impl FS for TestFs {
     }
     fn read_file(&self, path: &str) -> Option<String> {
         self.remove_ignore_lib_path(path);
+        self.reads.lock().unwrap().push(path.to_string());
         self.read_file_handling_build_info(path)
     }
     fn write_file(&self, path: &str, data: &str) -> Result<(), String> {
@@ -190,6 +193,7 @@ impl TestSys {
                 fs,
                 default_libs: Mutex::new(default_libs),
                 written_files: Mutex::new(FxHashSet::default()),
+                reads: Mutex::new(Vec::new()),
             }),
             default_library_path,
             cwd,
