@@ -1,17 +1,19 @@
 // What a non-recursive FSEvents watch delivers from its root's stream, which reports every change below the root.
 
+use std::os::unix::fs::PermissionsExt;
 use std::sync::{Arc, Mutex};
 
 use tsrs_fswatch::debounce::Debounce;
 use tsrs_fswatch::fsevents_darwin::{
     FLAG_ITEM_CREATED, FLAG_ITEM_IS_DIR, FLAG_ITEM_IS_FILE, FLAG_ITEM_REMOVED, FLAG_ITEM_RENAMED,
-    FseventsState, FseventsWatchSnapshot,
+    FLAG_KERNEL_DROPPED, FLAG_MUST_SCAN_SUB_DIRS, FLAG_USER_DROPPED, FseventsState,
+    FseventsWatchSnapshot,
 };
 use tsrs_fswatch::fsevents_darwin_ffi::{
-    StreamCallback, dispatch_test_events, new_stream_callback,
+    StreamCallback, dispatch_test_event, dispatch_test_events, new_stream_callback,
 };
 use tsrs_fswatch::pathcompare::BytePathComparer;
-use tsrs_fswatch::watcher::{DirWatch, ERR_WATCH_TERMINATED};
+use tsrs_fswatch::watcher::{DirWatch, ERR_OVERFLOW, ERR_WATCH_TERMINATED};
 
 // FSEvents.h
 const ITEM_INODE_META_MOD: u32 = 0x0000_0400;
@@ -239,6 +241,161 @@ fn a_recursive_watch_on_the_same_root_still_gets_every_event() {
             "the recursive watch missed {path}: {got:?}"
         );
     }
+    shallow.watch.destroy_debounce_for_test();
+    deep.watch.destroy_debounce_for_test();
+}
+
+const DROPS: [u32; 3] = [
+    FLAG_MUST_SCAN_SUB_DIRS | FLAG_USER_DROPPED,
+    FLAG_MUST_SCAN_SUB_DIRS | FLAG_KERNEL_DROPPED,
+    FLAG_MUST_SCAN_SUB_DIRS,
+];
+
+// Longer than the relisting's allowance for coarse timestamps: what changed before is not reported again.
+fn wait_past_timestamp_resolution() {
+    std::thread::sleep(std::time::Duration::from_millis(2100));
+}
+
+fn chmod(path: &str, mode: u32) {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+fn assert_overflow(watched: &Watched) {
+    let (got, err) = watched.fire();
+    assert_eq!(got, Vec::<String>::new());
+    assert!(err.is_some_and(|e| e.is(ERR_OVERFLOW)), "expected an overflow");
+}
+
+#[test]
+fn a_drop_on_a_non_recursive_stream_reports_what_changed_in_its_root() {
+    let f = Fixture::new("relist");
+    for name in ["same.ts", "mod.ts", "perm.ts", "atomic.ts", "gone.ts", "case.ts", "target.ts"] {
+        f.write(name);
+    }
+    for dir in ["gonedir", "sub2"] {
+        std::fs::create_dir(f.path(dir)).unwrap();
+    }
+    std::os::unix::fs::symlink(f.path("target.ts"), f.path("link.ts")).unwrap();
+    wait_past_timestamp_resolution();
+
+    let db = Debounce::new_without_loop_for_test();
+    let watched = Watched::new(&f.root, &f.root, false, &db);
+    let cb = stream(&[&watched]);
+
+    f.write("new.ts");
+    std::fs::create_dir(f.path("newdir")).unwrap();
+    std::fs::remove_file(f.path("gone.ts")).unwrap();
+    std::fs::remove_dir(f.path("gonedir")).unwrap();
+    // The same size: only the timestamps tell.
+    std::fs::write(f.path("mod.ts"), "export {} \n").unwrap();
+    chmod(&f.path("perm.ts"), 0o600);
+    std::fs::write(f.path("atomic.tmp"), "export const a = 1;\n").unwrap();
+    std::fs::rename(f.path("atomic.tmp"), f.path("atomic.ts")).unwrap();
+    std::fs::rename(f.path("case.ts"), f.path("Case.ts")).unwrap();
+    std::fs::write(nfd(&f.path("\u{e9}.ts")), "export {};\n").unwrap();
+    f.write("sub/deeper.ts");
+    chmod(&f.path("sub2"), 0o700);
+    std::fs::remove_file(f.path("link.ts")).unwrap();
+    std::os::unix::fs::symlink(f.path("mod.ts"), f.path("link.ts")).unwrap();
+    let fifo = std::ffi::CString::new(f.path("fifo")).unwrap();
+    // SAFETY: `fifo` is a NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    wait_past_timestamp_resolution();
+
+    let case_old_exists = std::fs::symlink_metadata(f.path("case.ts")).is_ok();
+    let mut want: Vec<String> = [
+        ("delete", "gone.ts"),
+        ("delete", "gonedir"),
+        ("update", "Case.ts"),
+        ("update", "atomic.ts"),
+        ("update", "fifo"),
+        ("update", "link.ts"),
+        ("update", "mod.ts"),
+        ("update", "new.ts"),
+        ("update", "newdir"),
+        ("update", "perm.ts"),
+        ("update", "sub2"),
+        ("update", "\u{e9}.ts"),
+        (if case_old_exists { "update" } else { "delete" }, "case.ts"),
+    ]
+    .iter()
+    .map(|(kind, name)| format!("{kind} {}", f.path(name)))
+    .collect();
+    want.sort();
+    dispatch_test_event(&cb, &f.root, DROPS[0]);
+    let (got, err) = watched.fire();
+    assert!(err.is_none(), "{err:?}");
+    assert_eq!(got, want);
+
+    // The next drop reports only what changed since this listing, for each kind of drop.
+    for (i, drop) in DROPS.into_iter().enumerate() {
+        f.write(&format!("later{i}.ts"));
+        wait_past_timestamp_resolution();
+        dispatch_test_event(&cb, &f.root, drop);
+        let (got, err) = watched.fire();
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!(got, [format!("update {}/later{i}.ts", f.root)]);
+    }
+    watched.watch.destroy_debounce_for_test();
+}
+
+#[test]
+fn a_drop_reported_above_or_below_the_root_relists_it_too() {
+    let f = Fixture::new("relist-paths");
+    let db = Debounce::new_without_loop_for_test();
+    let watched = Watched::new(&f.root, &f.root, false, &db);
+    let cb = stream(&[&watched]);
+    for (i, path) in [f.base.clone(), f.path("sub"), f.path("sub/x/y")].iter().enumerate() {
+        f.write(&format!("n{i}.ts"));
+        dispatch_test_event(&cb, path, DROPS[0]);
+        let (got, err) = watched.fire();
+        assert!(err.is_none(), "{err:?}");
+        assert!(got.contains(&format!("update {}/n{i}.ts", f.root)), "{path}: {got:?}");
+    }
+    watched.watch.destroy_debounce_for_test();
+}
+
+#[test]
+fn an_entry_changed_just_before_a_listing_is_reported_again() {
+    let f = Fixture::new("relist-recent");
+    f.write("recent.ts");
+    let db = Debounce::new_without_loop_for_test();
+    let watched = Watched::new(&f.root, &f.root, false, &db);
+    let cb = stream(&[&watched]);
+    dispatch_test_event(&cb, &f.root, DROPS[0]);
+    let (got, err) = watched.fire();
+    assert!(err.is_none(), "{err:?}");
+    assert_eq!(got, [format!("update {}/recent.ts", f.root)]);
+    watched.watch.destroy_debounce_for_test();
+}
+
+#[test]
+fn a_drop_after_the_root_was_replaced_or_removed_overflows() {
+    let f = Fixture::new("relist-replaced");
+    let db = Debounce::new_without_loop_for_test();
+    let watched = Watched::new(&f.root, &f.root, false, &db);
+    let cb = stream(&[&watched]);
+    std::fs::rename(&f.root, format!("{}/moved", f.base)).unwrap();
+    std::fs::create_dir(&f.root).unwrap();
+    dispatch_test_event(&cb, &f.root, DROPS[0]);
+    assert_overflow(&watched);
+
+    std::fs::remove_dir(&f.root).unwrap();
+    dispatch_test_event(&cb, &f.root, DROPS[0]);
+    assert_overflow(&watched);
+    watched.watch.destroy_debounce_for_test();
+}
+
+#[test]
+fn a_drop_on_a_stream_with_a_recursive_watch_overflows() {
+    let f = Fixture::new("relist-recursive");
+    let db = Debounce::new_without_loop_for_test();
+    let shallow = Watched::new(&f.root, &f.root, false, &db);
+    let deep = Watched::new(&f.root, &f.root, true, &db);
+    let cb = stream(&[&shallow, &deep]);
+    dispatch_test_event(&cb, &f.root, DROPS[0]);
+    assert_overflow(&shallow);
+    assert_overflow(&deep);
     shallow.watch.destroy_debounce_for_test();
     deep.watch.destroy_debounce_for_test();
 }

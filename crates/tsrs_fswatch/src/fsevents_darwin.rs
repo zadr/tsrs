@@ -19,17 +19,23 @@
 //   watches until the owner closes or reconciles the terminated watch.
 
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::collections::BTreeMap;
+use std::ffi::{OsStr, OsString};
+use std::os::unix::fs::MetadataExt;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
 use crate::fsevents_darwin_ffi::{
     FsEventStream, FsEventsCallbackPayload, StreamCallback, StreamStartError,
-    create_and_start_stream, fs_events_get_current_event_id, new_stream_callback, teardown_stream,
+    create_and_start_stream, fs_events_get_current_event_id, new_stream_callback, normalize_nfc,
+    teardown_stream,
 };
 use crate::pathcompare::ComparisonPath;
 use crate::watcher::{
     DirWatch, DwKey, ERR_OVERFLOW, Error, PlatformWatcher, WatcherBase, WatcherImpl,
-    err_watched_directory_removed,
+    err_watched_directory_removed, join_path_suffix,
 };
 
 // ----- FSEvents flag bits (from FSEvents.h) ------------------------------
@@ -42,6 +48,7 @@ const FLAG_HISTORY_DONE: u32 = 0x0000_0010;
 pub const FLAG_ITEM_CREATED: u32 = 0x0000_0100;
 pub const FLAG_ITEM_REMOVED: u32 = 0x0000_0200;
 pub const FLAG_ITEM_RENAMED: u32 = 0x0000_0800;
+const FLAG_ITEM_MODIFIED: u32 = 0x0000_1000;
 pub const FLAG_ITEM_IS_FILE: u32 = 0x0001_0000;
 pub const FLAG_ITEM_IS_DIR: u32 = 0x0002_0000;
 const FLAG_ITEM_IS_SYMLINK: u32 = 0x0004_0000;
@@ -187,6 +194,135 @@ impl NonRecursiveDepths {
 
 fn separators(path: &str) -> usize {
     path.bytes().filter(|&b| b == b'/').count()
+}
+
+// tsrs-only: the entries of the root of a stream whose watches are all non-recursive, as last listed. When fseventsd
+// drops events of such a stream (UserDropped | MustScanSubDirs, which a build beside a watched ancestor of the
+// project caused 65 to 122 times per 20k files written), the callback lists the root again and reports the entries
+// that changed, which is everything the watches can take, instead of an overflow: an overflow empties the CLI's
+// parse cache and rebuilds the program. The first listing is taken before the stream starts, so every change the
+// stream can drop is a change since a listing.
+pub(crate) struct Listing {
+    root: String,
+    id: (u64, u64),
+    taken: SystemTime,
+    entries: BTreeMap<OsString, Entry>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Entry {
+    ino: u64,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    // Zero for a directory: adding or removing one of its entries changes them, and FSEvents reports that only for
+    // the entry, which a non-recursive watch of the directory's parent does not take.
+    size: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+// The coarsest timestamps among the local file systems (FAT's mtime has 2 s): an entry changed this close to a
+// listing may change again without a different timestamp, so the next relisting reports it whatever it finds.
+const LISTING_TIMESTAMP_RESOLUTION: Duration = Duration::from_secs(2);
+
+impl Entry {
+    fn new(md: &std::fs::Metadata) -> Entry {
+        let dir = md.is_dir();
+        Entry {
+            ino: md.ino(),
+            mode: md.mode(),
+            uid: md.uid(),
+            gid: md.gid(),
+            size: if dir { 0 } else { md.size() },
+            mtime: if dir { (0, 0) } else { (md.mtime(), md.mtime_nsec()) },
+            ctime: if dir { (0, 0) } else { (md.ctime(), md.ctime_nsec()) },
+        }
+    }
+
+    fn type_flag(self) -> u32 {
+        match self.mode & libc::S_IFMT as u32 {
+            m if m == libc::S_IFDIR as u32 => FLAG_ITEM_IS_DIR,
+            m if m == libc::S_IFLNK as u32 => FLAG_ITEM_IS_SYMLINK,
+            m if m == libc::S_IFREG as u32 => FLAG_ITEM_IS_FILE,
+            _ => 0,
+        }
+    }
+
+    fn changed_near(self, time: SystemTime) -> bool {
+        let Some(since) = time
+            .checked_sub(LISTING_TIMESTAMP_RESOLUTION)
+            .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+        else {
+            return true;
+        };
+        self.ctime >= (since.as_secs() as i64, i64::from(since.subsec_nanos()))
+    }
+}
+
+impl Listing {
+    // The listing of the one root of `watches`, when none is recursive.
+    pub(crate) fn for_stream(watches: &[FseventsWatchSnapshot]) -> Option<Mutex<Listing>> {
+        let (first, rest) = watches.split_first()?;
+        if first.w.recursive
+            || rest.iter().any(|w| w.w.recursive || w.w.physical_dir != first.w.physical_dir)
+        {
+            return None;
+        }
+        Listing::read(&first.w.physical_dir).map(Mutex::new)
+    }
+
+    // None when the root or an entry cannot be read; the caller then reports an overflow.
+    fn read(root: &str) -> Option<Listing> {
+        let taken = SystemTime::now();
+        let md = std::fs::symlink_metadata(root).ok().filter(std::fs::Metadata::is_dir)?;
+        let mut entries = BTreeMap::new();
+        for entry in std::fs::read_dir(root).ok()? {
+            let entry = entry.ok()?;
+            match entry.metadata() {
+                Ok(md) => {
+                    entries.insert(entry.file_name(), Entry::new(&md));
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return None,
+            }
+        }
+        Some(Listing { root: root.to_string(), id: (md.dev(), md.ino()), taken, entries })
+    }
+
+    // The paths of the entries that changed since the last listing, with the flags of an event that reports each
+    // change; None when the root is gone or is another directory now.
+    fn relist(&mut self) -> Option<Vec<(String, u32)>> {
+        let now = Listing::read(&self.root)?;
+        if now.id != self.id {
+            return None;
+        }
+        let mut changes = Vec::new();
+        for (name, entry) in &now.entries {
+            if self.entries.get(name).is_none_or(|old| old != entry || old.changed_near(self.taken))
+            {
+                changes.extend(self.change(name, FLAG_ITEM_MODIFIED | entry.type_flag()));
+            }
+        }
+        for (name, old) in &self.entries {
+            if now.entries.contains_key(name) {
+                continue;
+            }
+            // A case-only rename on a case-insensitive volume leaves the old spelling resolvable, as FSEvents's rename
+            // event of the old spelling finds it.
+            let exists = std::fs::symlink_metadata(Path::new(&self.root).join(name)).is_ok();
+            let kind = if exists { FLAG_ITEM_MODIFIED } else { FLAG_ITEM_REMOVED };
+            changes.extend(self.change(name, kind | old.type_flag()));
+        }
+        *self = now;
+        Some(changes)
+    }
+
+    // An entry's path as FSEvents reports it (NFC); a name that is not UTF-8 has no such path.
+    fn change(&self, name: &OsStr, flag: u32) -> Option<(String, u32)> {
+        let name = normalize_nfc(name.to_str()?);
+        Some((join_path_suffix(&self.root, &name), flag))
+    }
 }
 
 impl FsEventsState {
@@ -479,16 +615,9 @@ pub(crate) fn fs_events_callback(cb: &StreamCallback, payload: &FsEventsCallback
 
     let num_events = payload.num_events;
     let watches = &cb.watches;
-    let mut touched: Vec<Arc<DirWatch>> = Vec::new();
-    let mut touched_set: FxHashSet<DwKey> = FxHashSet::default();
-    let mut touch = |w: &Arc<DirWatch>| {
-        if touched_set.insert(DwKey(Arc::clone(w))) {
-            touched.push(Arc::clone(w));
-        }
-    };
-
-    let mut first_file: Option<String> = None;
-    let mut burst = false;
+    let mut batch = Batch::new(watches);
+    // The watches of a relisted root that a drop of events reached, with the overflow each would get instead.
+    let mut dropped: Vec<(Arc<DirWatch>, Error)> = Vec::new();
     for i in 0..num_events {
         let flag = payload.flag(i);
         let event_id = payload.id(i);
@@ -507,9 +636,6 @@ pub(crate) fn fs_events_callback(cb: &StreamCallback, payload: &FsEventsCallback
         }
         let mut comparison = ComparisonPath::new(&path);
 
-        let is_removed = flag & FLAG_ITEM_REMOVED != 0;
-        let is_renamed = flag & FLAG_ITEM_RENAMED != 0;
-        let is_created = flag & FLAG_ITEM_CREATED != 0;
         let is_done = flag & FLAG_HISTORY_DONE != 0;
 
         if flag & FLAG_MUST_SCAN_SUB_DIRS != 0 {
@@ -525,8 +651,12 @@ pub(crate) fn fs_events_callback(cb: &StreamCallback, payload: &FsEventsCallback
                     continue;
                 }
                 if fsevents_overflow_matches_prepared(&watch.w, &mut comparison) {
-                    watch.w.events.set_error(overflow.clone());
-                    touch(&watch.w);
+                    if cb.listing.is_some() {
+                        dropped.push((Arc::clone(&watch.w), overflow.clone()));
+                    } else {
+                        watch.w.events.set_error(overflow.clone());
+                        batch.touch(&watch.w);
+                    }
                 }
             }
         }
@@ -539,7 +669,64 @@ pub(crate) fn fs_events_callback(cb: &StreamCallback, payload: &FsEventsCallback
             continue;
         }
 
-        let raw_path = &path;
+        batch.event(&path, &mut comparison, flag, event_id);
+    }
+
+    // Every event of the batch, dropped ones too, happened before the batch arrived, so one listing taken now covers
+    // them all, and it is newer than every event of the batch.
+    if !dropped.is_empty() {
+        let relisted = cb.listing.as_ref().and_then(|listing| listing.lock().unwrap().relist());
+        match relisted {
+            Some(changes) => {
+                let event_id = payload.id(num_events - 1);
+                for (path, flag) in changes {
+                    batch.event(&path, &mut ComparisonPath::new(&path), flag, event_id);
+                }
+            }
+            None => {
+                for (w, overflow) in dropped {
+                    w.events.set_error(overflow);
+                    batch.touch(&w);
+                }
+            }
+        }
+    }
+
+    batch.notify();
+}
+
+// The watches one callback batch reaches, in order, and whether it writes many files.
+struct Batch<'w> {
+    watches: &'w [FseventsWatchSnapshot],
+    touched: Vec<Arc<DirWatch>>,
+    touched_set: FxHashSet<DwKey>,
+    first_file: Option<String>,
+    burst: bool,
+}
+
+impl<'w> Batch<'w> {
+    fn new(watches: &'w [FseventsWatchSnapshot]) -> Batch<'w> {
+        Batch {
+            watches,
+            touched: Vec::new(),
+            touched_set: FxHashSet::default(),
+            first_file: None,
+            burst: false,
+        }
+    }
+
+    fn touch(&mut self, w: &Arc<DirWatch>) {
+        if self.touched_set.insert(DwKey(Arc::clone(w))) {
+            self.touched.push(Arc::clone(w));
+        }
+    }
+
+    fn event(&mut self, path: &str, comparison: &mut ComparisonPath, flag: u32, event_id: u64) {
+        let is_removed = flag & FLAG_ITEM_REMOVED != 0;
+        let is_renamed = flag & FLAG_ITEM_RENAMED != 0;
+        let is_created = flag & FLAG_ITEM_CREATED != 0;
+
+        let raw_path = path;
         let mut path_exists = false;
         let mut path_exists_known = false;
         // tsrs-only (`set_write_settling`): FSEvents has no close event, but a save that truncates the file and
@@ -565,20 +752,20 @@ pub(crate) fn fs_events_callback(cb: &StreamCallback, payload: &FsEventsCallback
         // rest, so the batch counts as a fire instead: the callbacks wait for 50 ms of quiet. A save, which changes
         // one file (an atomic save's temporary file is gone by the time its event arrives), is not delayed.
         if let Some(Some(_)) = file_len
-            && !burst
+            && !self.burst
         {
-            match &first_file {
-                None => first_file = Some(path.clone()),
-                Some(first) => burst = *first != path,
+            match &self.first_file {
+                None => self.first_file = Some(path.to_string()),
+                Some(first) => self.burst = first != path,
             }
         }
 
-        for watch in watches {
+        for watch in self.watches {
             if watch.state.terminated.load(Ordering::SeqCst) {
                 continue;
             }
             let w = &watch.w;
-            let Some(display_path) = fsevents_display_path_prepared(w, &mut comparison) else {
+            let Some(display_path) = fsevents_display_path_prepared(w, comparison) else {
                 continue;
             };
 
@@ -608,7 +795,7 @@ pub(crate) fn fs_events_callback(cb: &StreamCallback, payload: &FsEventsCallback
                     event_id,
                     &err_watched_directory_removed(),
                 ) {
-                    touch(w);
+                    self.touch(w);
                 }
                 if display_path == w.dir {
                     watch.state.terminated.store(true, Ordering::SeqCst);
@@ -636,7 +823,7 @@ pub(crate) fn fs_events_callback(cb: &StreamCallback, payload: &FsEventsCallback
                         event_id,
                         &err_watched_directory_removed(),
                     ) {
-                        touch(w);
+                        self.touch(w);
                     }
                     if display_path == w.dir {
                         watch.state.terminated.store(true, Ordering::SeqCst);
@@ -648,15 +835,19 @@ pub(crate) fn fs_events_callback(cb: &StreamCallback, payload: &FsEventsCallback
             } else {
                 w.events.update_at(&display_path, event_id);
             }
-            touch(w);
+            self.touch(w);
         }
     }
 
-    if burst && let Some(w) = touched.first() {
-        w.hold_leading_edge();
-    }
-    for w in touched {
-        w.notify();
+    fn notify(self) {
+        if self.burst
+            && let Some(w) = self.touched.first()
+        {
+            w.hold_leading_edge();
+        }
+        for w in self.touched {
+            w.notify();
+        }
     }
 }
 

@@ -13,8 +13,11 @@
 
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::marker::PhantomData;
+use std::sync::Mutex;
 
-use crate::fsevents_darwin::{FseventsWatchSnapshot, NonRecursiveDepths, fs_events_callback};
+use crate::fsevents_darwin::{
+    FseventsWatchSnapshot, Listing, NonRecursiveDepths, fs_events_callback,
+};
 
 type CFTypeRef = *const c_void;
 type CFIndex = isize;
@@ -383,13 +386,14 @@ pub struct StreamCallback {
     queue: DispatchQueueT, // per-stream serial dispatch queue
     pub(crate) watches: Vec<FseventsWatchSnapshot>,
     pub(crate) non_recursive_depths: Option<NonRecursiveDepths>,
+    pub(crate) listing: Option<Mutex<Listing>>,
 }
 
 // SAFETY: the dispatch queue handle is a thread-safe libdispatch object; `watches` is immutable after creation.
-// So is `non_recursive_depths`.
+// So is `non_recursive_depths`; `listing` is behind a mutex.
 unsafe impl Send for StreamCallback {}
 // SAFETY: as for Send: the queue handle is thread-safe and `watches` is never mutated after creation.
-// Neither is `non_recursive_depths`.
+// Neither is `non_recursive_depths`; `listing` is behind a mutex.
 unsafe impl Sync for StreamCallback {}
 
 // fsevents_darwin_ffi.go:536
@@ -420,6 +424,7 @@ pub fn new_stream_callback(watches: &[FseventsWatchSnapshot]) -> Option<Box<Stre
         queue,
         watches: watches.to_vec(),
         non_recursive_depths: NonRecursiveDepths::new(watches),
+        listing: Listing::for_stream(watches),
     }))
 }
 
