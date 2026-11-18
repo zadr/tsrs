@@ -245,3 +245,78 @@ fn write_settling_holds_multi_file_native_batches() {
     watch.destroy_debounce_for_test();
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[test]
+fn write_settling_counts_the_files_a_rename_batch_left() {
+    if !crate::isolated::in_child(
+        "fsevents_darwin_test::write_settling_counts_the_files_a_rename_batch_left",
+    ) {
+        return;
+    }
+    tsrs_fswatch::set_write_settling(true);
+    let (base, dirs) = root_dirs(1);
+    let path = |name: &str| format!("{}/{name}", dirs[0]);
+    std::fs::write(path("a.ts"), "export {};\n").unwrap();
+    std::fs::write(path("b.ts"), "export {};\n").unwrap();
+    std::os::unix::fs::symlink(path("a.ts"), path("link.ts")).unwrap();
+    let db = Debounce::new_without_loop_for_test();
+    let watch = DirWatch::new(
+        dirs[0].clone(),
+        dirs[0].clone(),
+        &db,
+        BytePathComparer::default(),
+        None,
+        true,
+    );
+    let delivered = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = Arc::clone(&delivered);
+    watch.add_callback(
+        &dirs[0],
+        &dirs[0],
+        true,
+        Arc::new(move |events, _| {
+            let mut events: Vec<String> =
+                events.iter().map(|e| format!("{} {}", e.kind, e.path)).collect();
+            events.sort();
+            seen.lock().unwrap().push(events);
+        }),
+        None,
+        "",
+    );
+    let cb = tsrs_fswatch::fsevents_darwin_ffi::new_stream_callback(&[
+        tsrs_fswatch::fsevents_darwin::FseventsWatchSnapshot {
+            w: Arc::clone(&watch),
+            state: Arc::new(tsrs_fswatch::fsevents_darwin::FseventsState::default()),
+        },
+    ])
+    .unwrap();
+    let renamed_file = tsrs_fswatch::fsevents_darwin::FLAG_ITEM_RENAMED
+        | tsrs_fswatch::fsevents_darwin::FLAG_ITEM_IS_FILE;
+
+    // An atomic save: the temporary file is gone, the saved one is there. One file: no burst.
+    tsrs_fswatch::fsevents_darwin_ffi::dispatch_test_events(
+        &cb,
+        &[(&path("a.ts.tmp"), renamed_file), (&path("a.ts"), renamed_file)],
+    );
+    assert!(!db.leading_edge_is_held_for_test());
+    watch.trigger_callbacks_for_test();
+    assert_eq!(
+        *delivered.lock().unwrap(),
+        [[format!("delete {}", path("a.ts.tmp")), format!("update {}", path("a.ts"))]]
+    );
+    delivered.lock().unwrap().clear();
+
+    // A symlink reported as a file counts as the file it points to: two files, a burst.
+    tsrs_fswatch::fsevents_darwin_ffi::dispatch_test_events(
+        &cb,
+        &[(&path("link.ts"), renamed_file), (&path("b.ts"), renamed_file)],
+    );
+    assert!(db.leading_edge_is_held_for_test());
+    watch.trigger_callbacks_for_test();
+    assert_eq!(
+        *delivered.lock().unwrap(),
+        [[format!("update {}", path("b.ts")), format!("update {}", path("link.ts"))]]
+    );
+    watch.destroy_debounce_for_test();
+    let _ = std::fs::remove_dir_all(&base);
+}

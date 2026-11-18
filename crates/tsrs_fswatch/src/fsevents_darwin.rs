@@ -727,8 +727,9 @@ impl<'w> Batch<'w> {
         let is_created = flag & FLAG_ITEM_CREATED != 0;
 
         let raw_path = path;
-        let mut path_exists = false;
-        let mut path_exists_known = false;
+        // tsrs-only: one lstat answers both the write settling below and whether a renamed path exists (an atomic save
+        // stat-ed and lstat-ed each of its paths). It differs from a stat only for a symlink.
+        let mut lstat: Option<Option<std::fs::Metadata>> = None;
         // tsrs-only (`set_write_settling`): FSEvents has no close event, but a save that truncates the file and
         // writes it later (a slow writer, or `ftruncate` and then `write`) is seen empty by the time its event
         // arrives (FSEvents delivers about 12 ms after the write). An empty file holds the callbacks like an
@@ -737,13 +738,14 @@ impl<'w> Batch<'w> {
         let file_len =
             (crate::watcher::write_settling() && flag & FLAG_ITEM_IS_FILE != 0).then(|| {
                 if is_removed && !is_created {
-                    None
-                } else {
-                    std::fs::metadata(raw_path)
-                        .ok()
-                        .filter(std::fs::Metadata::is_file)
-                        .map(|m| m.len())
+                    return None;
                 }
+                match lstat.get_or_insert_with(|| std::fs::symlink_metadata(raw_path).ok()) {
+                    Some(md) if md.is_symlink() => std::fs::metadata(raw_path).ok(),
+                    md => md.clone(),
+                }
+                .filter(std::fs::Metadata::is_file)
+                .map(|m| m.len())
             });
         let being_written = file_len.map(|len| len == Some(0));
         // tsrs-only (`set_write_settling`): a batch that changed two files that still exist is a tool writing many
@@ -802,11 +804,7 @@ impl<'w> Batch<'w> {
                     w.events.set_error(err_watched_directory_removed());
                 }
             } else if is_renamed || (is_removed && is_created) {
-                if !path_exists_known {
-                    path_exists = std::fs::symlink_metadata(raw_path).is_ok();
-                    path_exists_known = true;
-                }
-                if path_exists {
+                if lstat.get_or_insert_with(|| std::fs::symlink_metadata(raw_path).ok()).is_some() {
                     if display_path == w.dir {
                         w.events.update_watch_root_at(&display_path, event_id);
                     } else {
