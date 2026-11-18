@@ -1405,6 +1405,10 @@ impl DirWatch {
         ignore: Option<IgnoreFunc>,
         file: &str,
     ) -> u64 {
+        debug_assert!(
+            self.recursive || (!recursive && dir == self.dir),
+            "a non-recursive watch has only non-recursive callbacks for its own directory"
+        );
         let mut st = self.mu.lock().unwrap();
         st.next_cb_id += 1;
         let id = st.next_cb_id;

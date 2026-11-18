@@ -40,10 +40,10 @@ pub const FLAG_KERNEL_DROPPED: u32 = 0x0000_0004;
 const FLAG_HISTORY_DONE: u32 = 0x0000_0010;
 
 pub const FLAG_ITEM_CREATED: u32 = 0x0000_0100;
-const FLAG_ITEM_REMOVED: u32 = 0x0000_0200;
-const FLAG_ITEM_RENAMED: u32 = 0x0000_0800;
+pub const FLAG_ITEM_REMOVED: u32 = 0x0000_0200;
+pub const FLAG_ITEM_RENAMED: u32 = 0x0000_0800;
 pub const FLAG_ITEM_IS_FILE: u32 = 0x0001_0000;
-const FLAG_ITEM_IS_DIR: u32 = 0x0002_0000;
+pub const FLAG_ITEM_IS_DIR: u32 = 0x0002_0000;
 const FLAG_ITEM_IS_SYMLINK: u32 = 0x0004_0000;
 const FLAG_ITEM_IS_HARDLINK: u32 = 0x0010_0000;
 const FLAG_ITEM_IS_LAST_HARDLINK: u32 = 0x0020_0000;
@@ -149,6 +149,44 @@ pub const FSEVENTS_MAX_ROOT_STREAMS: usize = 256;
 pub struct FseventsWatchSnapshot {
     pub w: Arc<DirWatch>,
     pub state: Arc<FseventsState>,
+}
+
+// tsrs-only: the separator counts of the event paths that the watches of a stream take, when none is recursive.
+// A stream reports every change below its root, but a non-recursive watch takes only its root and the root's direct
+// children (`trigger_callbacks` drops the rest), so the callback skips the other paths before the per-watch work
+// (path conversion, rebasing, the write-settling stat). A watch of a directory that a failed lookup climbed to (an
+// ancestor of the project) has a stream of its own, and a build beside the project sent it a hundred thousand events,
+// 99.9% of them for no watch. Rebasing, case folding and NFC keep a path's separators, so a path that a watch takes
+// has as many separators as one of its roots, or one more.
+#[derive(Clone, Copy)]
+pub(crate) struct NonRecursiveDepths(u64);
+
+impl NonRecursiveDepths {
+    pub(crate) fn new(watches: &[FseventsWatchSnapshot]) -> Option<NonRecursiveDepths> {
+        let mut depths = 0u64;
+        for watch in watches {
+            if watch.w.recursive {
+                return None;
+            }
+            for root in [&watch.w.physical_dir, &watch.w.dir] {
+                let n = separators(root);
+                if n + 1 >= u64::BITS as usize {
+                    return None;
+                }
+                depths |= 0b11 << n;
+            }
+        }
+        Some(NonRecursiveDepths(depths))
+    }
+
+    fn takes(self, path: &str) -> bool {
+        let n = separators(path);
+        n < u64::BITS as usize && self.0 & (1 << n) != 0
+    }
+}
+
+fn separators(path: &str) -> usize {
+    path.bytes().filter(|&b| b == b'/').count()
 }
 
 impl FsEventsState {
@@ -454,8 +492,17 @@ pub(crate) fn fs_events_callback(cb: &StreamCallback, payload: &FsEventsCallback
     for i in 0..num_events {
         let flag = payload.flag(i);
         let event_id = payload.id(i);
-        let path = payload.path_nfc(i);
-        if path.is_empty() {
+        let event_path = payload.path(i);
+        let depths = cb
+            .non_recursive_depths
+            .filter(|_| flag & (FLAG_MUST_SCAN_SUB_DIRS | FLAG_HISTORY_DONE) == 0);
+        if let Some(depths) = depths
+            && event_path.ascii().is_some_and(|path| !depths.takes(path))
+        {
+            continue;
+        }
+        let path = event_path.nfc();
+        if path.is_empty() || depths.is_some_and(|depths| !depths.takes(&path)) {
             continue;
         }
         let mut comparison = ComparisonPath::new(&path);

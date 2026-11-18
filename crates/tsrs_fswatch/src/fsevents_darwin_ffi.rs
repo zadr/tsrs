@@ -11,9 +11,10 @@
 // All `unsafe` of the FSEvents backend is confined to this file: the C declarations, the wrappers below (each
 // documents the invariant it relies on) and the callback.
 
-use std::ffi::{CString, c_char, c_void};
+use std::ffi::{CStr, CString, c_char, c_void};
+use std::marker::PhantomData;
 
-use crate::fsevents_darwin::{FseventsWatchSnapshot, fs_events_callback};
+use crate::fsevents_darwin::{FseventsWatchSnapshot, NonRecursiveDepths, fs_events_callback};
 
 type CFTypeRef = *const c_void;
 type CFIndex = isize;
@@ -73,6 +74,8 @@ unsafe extern "C" {
     fn cf_string_get_length(string: CFTypeRef) -> CFIndex;
     #[link_name = "CFStringGetMaximumSizeForEncoding"]
     fn cf_string_get_maximum_size_for_encoding(length: CFIndex, encoding: u32) -> CFIndex;
+    #[link_name = "CFStringGetCStringPtr"]
+    fn cf_string_get_c_string_ptr(string: CFTypeRef, encoding: u32) -> *const c_char;
     #[link_name = "CFStringGetCString"]
     fn cf_string_get_c_string(
         string: CFTypeRef,
@@ -321,12 +324,43 @@ impl FsEventsCallbackPayload {
         unsafe { *self.ids.add(i) }
     }
 
-    // Go `cfStringToNFC(cfArrayGetValueAtIndex(paths, i))`.
-    pub(crate) fn path_nfc(&self, i: usize) -> String {
+    // Go `cfArrayGetValueAtIndex(paths, i)`.
+    pub(crate) fn path(&self, i: usize) -> EventPath<'_> {
         // SAFETY: with kFSEventStreamCreateFlagUseCFTypes `paths` is a CFArray of `num_events` CFStrings, valid for
         // the duration of the callback.
-        let path_ref = unsafe { cf_array_get_value_at_index(self.paths, i as CFIndex) };
-        cf_string_to_nfc(path_ref)
+        let cf = unsafe { cf_array_get_value_at_index(self.paths, i as CFIndex) };
+        EventPath { cf, payload: PhantomData }
+    }
+}
+
+// The CFString of one event's path, valid while the callback's arguments are.
+#[derive(Clone, Copy)]
+pub(crate) struct EventPath<'p> {
+    cf: CFTypeRef,
+    payload: PhantomData<&'p FsEventsCallbackPayload>,
+}
+
+impl<'p> EventPath<'p> {
+    // tsrs-only: the path read in place, without a copy, when its CFString stores it as ASCII bytes, as it does every
+    // ASCII path FSEvents delivers. ASCII is its own NFC form, so this equals `nfc()`.
+    pub(crate) fn ascii(self) -> Option<&'p str> {
+        if self.cf.is_null() {
+            return None;
+        }
+        // SAFETY: `cf` is a CFString of the payload, alive for 'p; the result is NULL or a NUL-terminated buffer that
+        // the string owns and does not change.
+        let ptr = unsafe { cf_string_get_c_string_ptr(self.cf, CF_STRING_ENCODING_UTF8) };
+        if ptr.is_null() {
+            return None;
+        }
+        // SAFETY: `ptr` is a NUL-terminated buffer alive for 'p (above).
+        let bytes = unsafe { CStr::from_ptr(ptr) }.to_bytes();
+        std::str::from_utf8(bytes).ok().filter(|s| s.is_ascii())
+    }
+
+    // Go `cfStringToNFC`.
+    pub(crate) fn nfc(self) -> String {
+        cf_string_to_nfc(self.cf)
     }
 }
 
@@ -348,11 +382,14 @@ pub fn dispatch_test_event(cb: &StreamCallback, path: &str, flags: u32) {
 pub struct StreamCallback {
     queue: DispatchQueueT, // per-stream serial dispatch queue
     pub(crate) watches: Vec<FseventsWatchSnapshot>,
+    pub(crate) non_recursive_depths: Option<NonRecursiveDepths>,
 }
 
 // SAFETY: the dispatch queue handle is a thread-safe libdispatch object; `watches` is immutable after creation.
+// So is `non_recursive_depths`.
 unsafe impl Send for StreamCallback {}
 // SAFETY: as for Send: the queue handle is thread-safe and `watches` is never mutated after creation.
+// Neither is `non_recursive_depths`.
 unsafe impl Sync for StreamCallback {}
 
 // fsevents_darwin_ffi.go:536
@@ -379,7 +416,11 @@ pub fn new_stream_callback(watches: &[FseventsWatchSnapshot]) -> Option<Box<Stre
     if queue.is_null() {
         return None;
     }
-    Some(Box::new(StreamCallback { queue, watches: watches.to_vec() }))
+    Some(Box::new(StreamCallback {
+        queue,
+        watches: watches.to_vec(),
+        non_recursive_depths: NonRecursiveDepths::new(watches),
+    }))
 }
 
 extern "C" fn dispatch_noop(_: *mut c_void) {}

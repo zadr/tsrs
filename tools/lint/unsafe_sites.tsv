@@ -385,9 +385,11 @@ crates/tsrs_fswatch/src/fsevents_darwin_ffi.rs	(file)	extern	boundary		keep	OS, 
 crates/tsrs_fswatch/src/fsevents_darwin_ffi.rs	(file)	extern	boundary	#2	keep	OS, FFI or allocator call
 crates/tsrs_fswatch/src/fsevents_darwin_ffi.rs	(file)	extern	boundary	#3	keep	OS, FFI or allocator call
 crates/tsrs_fswatch/src/fsevents_darwin_ffi.rs	CFRef::drop	block	boundary	`CFRef` is only constructed from a non-NULL object returned by a CF "Create"/"Copy" function,	keep	OS, FFI or allocator call
+crates/tsrs_fswatch/src/fsevents_darwin_ffi.rs	EventPath::ascii	block	boundary	`cf` is a CFString of the payload, alive for 'p; the result is NULL or a NUL-terminated buffer that	keep	OS, FFI or allocator call
+crates/tsrs_fswatch/src/fsevents_darwin_ffi.rs	EventPath::ascii	block	boundary	`ptr` is a NUL-terminated buffer alive for 'p (above).	keep	OS, FFI or allocator call
 crates/tsrs_fswatch/src/fsevents_darwin_ffi.rs	FsEventsCallbackPayload::flag	block	boundary	FSEvents passes `num_events` flags; callers index below `num_events`.	keep	OS, FFI or allocator call
 crates/tsrs_fswatch/src/fsevents_darwin_ffi.rs	FsEventsCallbackPayload::id	block	boundary	as `flag`.	keep	OS, FFI or allocator call
-crates/tsrs_fswatch/src/fsevents_darwin_ffi.rs	FsEventsCallbackPayload::path_nfc	block	boundary	with kFSEventStreamCreateFlagUseCFTypes `paths` is a CFArray of `num_events` CFStrings, valid for	keep	OS, FFI or allocator call
+crates/tsrs_fswatch/src/fsevents_darwin_ffi.rs	FsEventsCallbackPayload::path	block	boundary	with kFSEventStreamCreateFlagUseCFTypes `paths` is a CFArray of `num_events` CFStrings, valid for	keep	OS, FFI or allocator call
 crates/tsrs_fswatch/src/fsevents_darwin_ffi.rs	StreamCallback::close	block	boundary	the queue was created by `new_stream_callback` and is released exactly once.	keep	OS, FFI or allocator call
 crates/tsrs_fswatch/src/fsevents_darwin_ffi.rs	StreamCallback::wait_dispatch_queue	block	boundary	`queue` is a live queue owned by this callback; the work function does nothing.	keep	OS, FFI or allocator call
 crates/tsrs_fswatch/src/fsevents_darwin_ffi.rs	cf_array_create	block	boundary	`ptrs` holds `ptrs.len()` valid CF objects for the duration of the call.	keep	OS, FFI or allocator call

@@ -3,6 +3,8 @@ mod eventlist_test;
 #[cfg(target_os = "macos")]
 mod fsevents_darwin_test;
 mod fsevents_load;
+#[cfg(target_os = "macos")]
+mod fsevents_non_recursive_test;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod isolated;
 mod kqueue_macos;
