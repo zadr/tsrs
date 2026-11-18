@@ -7,7 +7,7 @@ use tsrs_core::tspath;
 use tsrs_vfs::osvfs::os::*;
 
 // A fresh directory under the system temp dir (t.TempDir()).
-pub(super) fn temp_dir() -> String {
+pub fn temp_dir() -> String {
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
     let dir = std::env::temp_dir().join(format!(
         "tsrs_vfs_test_{}_{}",
@@ -19,7 +19,7 @@ pub(super) fn temp_dir() -> String {
     dir.to_string_lossy().into_owned()
 }
 
-pub(super) fn mklink(target: &str, link: &str, is_dir: bool) {
+pub fn mklink(target: &str, link: &str, is_dir: bool) {
     #[cfg(unix)]
     {
         let _ = is_dir;
