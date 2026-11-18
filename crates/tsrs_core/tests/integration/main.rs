@@ -1,5 +1,7 @@
 #[cfg(all(compressed_ptrs, unix))]
 mod arena_retired_test;
+#[cfg(compressed_ptrs)]
+mod arena_slab_cache_test;
 mod arena_test;
 mod bfs_test;
 mod collections {
@@ -21,6 +23,8 @@ mod glob {
 }
 mod gocompat_test;
 mod goslices_test;
+#[cfg(compressed_ptrs)]
+mod isolated;
 mod jsnum {
     mod big_test;
     mod jsnum_test;

@@ -541,25 +541,50 @@ impl Drop for CurrentSlab {
 
 /// Released standard-size slabs kept for reuse instead of going back to the system (compressed pointers: a
 /// decommit and, at the next slab, a commit and fresh page faults). Short-lived regions (one per file during emit)
-/// release and take slabs at a high rate. Addresses, at most `SLAB_CACHE_MAX`.
+/// release and take slabs at a high rate. Address and whether its pages were given back
+/// (`release_cached_slab_pages`), at most `SLAB_CACHE_MAX`.
 #[cfg(compressed_ptrs)]
-static SLAB_CACHE: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+static SLAB_CACHE: Mutex<Vec<(usize, bool)>> = Mutex::new(Vec::new());
 #[cfg(compressed_ptrs)]
 const SLAB_CACHE_MAX: usize = 64;
+
+/// Gives the pages of the cached slabs back to the system and keeps the slabs.
+///
+/// For a long-lived process once a burst of work is done: the cache refills from the frees at the end of a watch
+/// cycle and otherwise stays resident until the next cycle takes it (vscode: up to all 64 slabs, 57.6 MB by
+/// `mincore`; xstate up to 42.3 MB). A slab taken again is made the process's own before use (`new_slab`), without
+/// new page faults on macOS unless the system took the pages meanwhile.
+pub fn release_cached_slab_pages() {
+    #[cfg(compressed_ptrs)]
+    for (addr, given_back) in
+        SLAB_CACHE.lock().unwrap().iter_mut().filter(|(_, given_back)| !*given_back)
+    {
+        // SAFETY: a cached slab is a committed chunk that nothing uses; the lock keeps `new_slab` from taking it
+        // before the advice is recorded.
+        *given_back = unsafe {
+            crate::reserve::free_reusable(std::ptr::with_exposed_provenance_mut(*addr), SLAB_SIZE)
+        };
+    }
+}
 
 fn new_slab(size: usize, live: usize) -> *const Slab {
     let size = size.div_ceil(PAGE) * PAGE;
     #[cfg(compressed_ptrs)]
     if size == SLAB_SIZE {
         let cached = SLAB_CACHE.lock().unwrap().pop();
-        if let Some(addr) = cached {
+        if let Some((addr, given_back)) = cached {
             let base = std::ptr::with_exposed_provenance_mut::<u8>(addr);
-            return Box::into_raw(Box::new(Slab {
-                base,
-                size,
-                live: AtomicUsize::new(live),
-                retired: AtomicBool::new(false),
-            }));
+            // SAFETY: taken out of the cache, so nothing else uses it; its pages were given back if `given_back`.
+            if !given_back || unsafe { crate::reserve::reuse(base, size) } {
+                return Box::into_raw(Box::new(Slab {
+                    base,
+                    size,
+                    live: AtomicUsize::new(live),
+                    retired: AtomicBool::new(false),
+                }));
+            }
+            // SAFETY: from `os_chunk` with this size; nothing uses it.
+            unsafe { crate::reserve::release_chunk(base, size) };
         }
     }
     let base =
@@ -659,7 +684,7 @@ fn slab_release_ex(slab: *const Slab, retire: bool) {
     {
         let mut cache = SLAB_CACHE.lock().unwrap();
         if s.size == SLAB_SIZE && cache.len() < SLAB_CACHE_MAX {
-            cache.push(s.base.expose_provenance());
+            cache.push((s.base.expose_provenance(), false));
         } else {
             drop(cache);
             // SAFETY: from `os_chunk` with this size; every chunk carved from it was released.

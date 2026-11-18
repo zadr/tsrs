@@ -286,6 +286,40 @@ pub(crate) unsafe fn discard(p: *mut u8, len: usize) {
     decommit(q, end - start);
 }
 
+/// Lets the system take the pages of `p .. p + len` (whole pages of a chunk from `alloc_chunk`) while the range stays
+/// committed. macOS: `MADV_FREE_REUSABLE`, which takes them out of the footprint at once; they keep their contents
+/// until the system needs the memory, and `reuse` must run before they are written again (a page written without it
+/// can still be dropped). Elsewhere: `MADV_DONTNEED` (Linux: the pages go at once and read back as zeros; no `reuse`
+/// needed). Returns whether the system took the advice.
+///
+/// # Safety
+/// Nothing may use the memory until `reuse` returned true.
+#[cfg(unix)]
+pub(crate) unsafe fn free_reusable(p: *mut u8, len: usize) -> bool {
+    #[cfg(target_os = "macos")]
+    let advice = libc::MADV_FREE_REUSABLE;
+    #[cfg(not(target_os = "macos"))]
+    let advice = libc::MADV_DONTNEED;
+    // SAFETY: whole pages inside the reservation that nothing uses (this function's contract).
+    unsafe { libc::madvise(p.cast(), len, advice) == 0 }
+}
+
+/// Makes pages given up by `free_reusable` the process's own again; true when they may be used.
+///
+/// # Safety
+/// `p .. p + len` is a range `free_reusable` took, and nothing uses it yet.
+#[cfg(unix)]
+pub(crate) unsafe fn reuse(p: *mut u8, len: usize) -> bool {
+    #[cfg(target_os = "macos")]
+    // SAFETY: whole pages inside the reservation that nothing uses (this function's contract).
+    return unsafe { libc::madvise(p.cast(), len, libc::MADV_FREE_REUSE) == 0 };
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (p, len);
+        true
+    }
+}
+
 /// Bytes of the reservation handed out as chunks and not released.
 pub(crate) fn reserved_in_use() -> usize {
     CHUNKS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).live

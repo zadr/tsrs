@@ -128,6 +128,7 @@ impl Freer {
     ///   as this one: what they allocated during the cycle is freed here, from another thread, and such a
     ///   block stays allocated in its page (unpurgeable) until the owning thread collects
     ///   (notes/watch-macos.md, "memory").
+    /// - The arena's cached slabs give their pages back (`arena::release_cached_slab_pages`).
     pub(crate) fn after_cycle(&self) {
         self.run(|| {
             #[cfg(target_os = "macos")]
@@ -135,6 +136,7 @@ impl Freer {
                 tsrs_compiler::worker_pool().broadcast(|_| tsrs_core::memsplit::heap_collect(true));
                 tsrs_core::memsplit::heap_collect(true);
             }
+            tsrs_core::arena::release_cached_slab_pages();
         });
     }
 
