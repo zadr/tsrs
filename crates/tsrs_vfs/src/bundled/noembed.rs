@@ -39,7 +39,7 @@ pub fn executable_realpath(path: &Path) -> io::Result<PathBuf> {
     // the compiler's filesystem, which rejects device and network paths.
     #[cfg(windows)]
     {
-        crate::osvfs::native_realpath(&path.to_string_lossy()).map(PathBuf::from)
+        crate::osvfs::native_realpath(&path.to_string_lossy(), None).map(PathBuf::from)
     }
     #[cfg(not(windows))]
     {

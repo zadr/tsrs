@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
 use crate::FS as VFS;
+use crate::osvfs::RealpathMemo;
 use crate::{Entries, FileInfo};
 
 // SyncMap is collections.SyncMap: a concurrent map with Load/Store/Clear, keyed by path strings and probed with
@@ -37,6 +38,8 @@ pub struct FS<T: VFS> {
     file_exists_cache: SyncMap<bool>,
     get_accessible_entries_cache: SyncMap<Entries>,
     realpath_cache: SyncMap<String>,
+    // What realpath found on the way to each answer, for inputs the full-path cache has not seen.
+    realpath_memo: RealpathMemo,
     stat_cache: SyncMap<Option<FileInfo>>,
 }
 
@@ -48,6 +51,7 @@ pub fn from<T: VFS>(fs: T) -> FS<T> {
         file_exists_cache: SyncMap::new(),
         get_accessible_entries_cache: SyncMap::new(),
         realpath_cache: SyncMap::new(),
+        realpath_memo: RealpathMemo::default(),
         stat_cache: SyncMap::new(),
     }
 }
@@ -68,6 +72,7 @@ impl<T: VFS> FS<T> {
         self.file_exists_cache.clear();
         self.get_accessible_entries_cache.clear();
         self.realpath_cache.clear();
+        self.realpath_memo.clear();
         self.stat_cache.clear();
     }
 
@@ -136,7 +141,11 @@ impl<T: VFS> VFS for FS<T> {
             return ret;
         }
 
-        let ret = self.fs.realpath(path);
+        let ret = if self.enabled() {
+            self.fs.realpath_memoized(path, &self.realpath_memo)
+        } else {
+            self.fs.realpath(path)
+        };
 
         if self.enabled() {
             self.realpath_cache.store(path, ret.clone());

@@ -4,6 +4,8 @@ use std::time::SystemTime;
 use bitflags::bitflags;
 use rustc_hash::FxHashSet;
 
+use crate::osvfs::RealpathMemo;
+
 // FS is a file system abstraction.
 pub trait FS: Send + Sync {
     // UseCaseSensitiveFileNames returns true if the file system is case-sensitive.
@@ -39,6 +41,12 @@ pub trait FS: Send + Sync {
     // Realpath returns the "real path" of the specified path,
     // following symlinks and correcting filename casing.
     fn realpath(&self, path: &str) -> String;
+
+    // Realpath that reuses and extends what earlier calls of one cache generation learned (cachedvfs owns the memo).
+    // File systems that forward realpath to the OS file system forward this too.
+    fn realpath_memoized(&self, path: &str, _memo: &RealpathMemo) -> String {
+        self.realpath(path)
+    }
 }
 
 macro_rules! forward_fs {
@@ -80,6 +88,9 @@ macro_rules! forward_fs {
         }
         fn realpath(&self, path: &str) -> String {
             (**self).realpath(path)
+        }
+        fn realpath_memoized(&self, path: &str, memo: &RealpathMemo) -> String {
+            (**self).realpath_memoized(path, memo)
         }
     };
 }

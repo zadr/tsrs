@@ -5,6 +5,7 @@ use rustc_hash::FxHashMap;
 
 use super::embed_generated::EMBEDDED_CONTENTS;
 use super::libs_generated::LIB_NAMES;
+use crate::osvfs::RealpathMemo;
 use crate::{Entries, FS, FileInfo, FileMode};
 
 const SCHEME: &str = "bundled:///";
@@ -122,6 +123,13 @@ impl<T: FS> FS for WrappedFS<T> {
             return path.to_string();
         }
         self.fs.realpath(path)
+    }
+
+    fn realpath_memoized(&self, path: &str, memo: &RealpathMemo) -> String {
+        if split_path(path).is_some() {
+            return path.to_string();
+        }
+        self.fs.realpath_memoized(path, memo)
     }
 
     fn write_file(&self, path: &str, data: &str) -> Result<(), String> {

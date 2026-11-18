@@ -1888,3 +1888,73 @@ fn did_change_file_with_synthetic_imports_reuses_the_program() {
     }
     session.close();
 }
+
+// On the real file system: a pnpm update that relinks a package to another version and prunes the old one resolves
+// to the new version in the next snapshot (what realpath learned through the old link belongs to the old snapshot).
+#[cfg(unix)]
+#[test]
+fn did_change_watched_files_relinked_package_on_disk() {
+    let root = std::env::temp_dir().join(format!("tsrs-project-relink-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let index_text = "import type { N } from \"pkg\";\nexport const n: N = 2;\n";
+    for (name, content) in [
+        ("tsconfig.json", r#"{ "compilerOptions": { "noLib": true }, "files": ["src/index.ts"] }"#),
+        ("src/index.ts", index_text),
+        (
+            "node_modules/.pnpm/pkg@1/node_modules/pkg/package.json",
+            r#"{ "name": "pkg", "types": "index.d.ts" }"#,
+        ),
+        ("node_modules/.pnpm/pkg@1/node_modules/pkg/index.d.ts", "export type N = 1;\n"),
+        (
+            "node_modules/.pnpm/pkg@2/node_modules/pkg/package.json",
+            r#"{ "name": "pkg", "types": "index.d.ts" }"#,
+        ),
+        ("node_modules/.pnpm/pkg@2/node_modules/pkg/index.d.ts", "export type N = 2;\n"),
+    ] {
+        let path = root.join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+    let root = std::fs::canonicalize(&root).unwrap().to_string_lossy().into_owned();
+    let link = format!("{root}/node_modules/pkg");
+    std::os::unix::fs::symlink(".pnpm/pkg@1/node_modules/pkg", &link).unwrap();
+
+    let (mut init, _utils) = projecttestutil::get_session_init_options(&[], None);
+    init.fs = Arc::new(tsrs_vfs::bundled::wrap_fs(tsrs_vfs::osvfs::fs()));
+    let session = tsrs_project::session::new_session(&init);
+    let index = format!("{root}/src/index.ts");
+    session.did_open_file(
+        &ctx(),
+        uri(&format!("file://{index}")),
+        1,
+        index_text.to_string(),
+        lsproto::LanguageKind::TYPE_SCRIPT,
+    );
+    let store = |version: u32| {
+        format!("{root}/node_modules/.pnpm/pkg@{version}/node_modules/pkg/index.d.ts")
+    };
+    let program = ls_program(&session, &index);
+    assert!(program.get_source_file(&store(1)).is_some());
+    assert_eq!(semantic_diagnostics_count(program, &index), 1);
+
+    std::fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(".pnpm/pkg@2/node_modules/pkg", &link).unwrap();
+    let old = format!("{root}/node_modules/.pnpm/pkg@1");
+    std::fs::remove_dir_all(&old).unwrap();
+    let ev = |type_, path: &str| lsproto::FileEvent { type_, uri: uri(&format!("file://{path}")) };
+    session.did_change_watched_files(
+        &ctx(),
+        &[
+            ev(lsproto::FileChangeType::DELETED, &format!("{old}/node_modules/pkg/index.d.ts")),
+            ev(lsproto::FileChangeType::DELETED, &format!("{old}/node_modules/pkg/package.json")),
+            ev(lsproto::FileChangeType::DELETED, &old),
+            ev(lsproto::FileChangeType::DELETED, &link),
+            ev(lsproto::FileChangeType::CREATED, &link),
+        ],
+    );
+
+    let program = ls_program(&session, &index);
+    assert!(program.get_source_file(&store(2)).is_some());
+    assert_eq!(semantic_diagnostics_count(program, &index), 0);
+    std::fs::remove_dir_all(&root).unwrap();
+}

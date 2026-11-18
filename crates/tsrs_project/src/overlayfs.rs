@@ -8,6 +8,7 @@ use tsrs_ls::lsconv::{self, LSPLineMap, Script};
 use tsrs_ls::sourcemap::{ECMALineInfo, create_ecma_line_info};
 use tsrs_ls::spanmap::{self, SpanMap};
 use tsrs_lsproto as lsproto;
+use tsrs_vfs::osvfs::RealpathMemo;
 use tsrs_vfs::{Entries, FS, FileInfo, FileMode};
 
 use crate::filechange::{FileChange, FileChangeExpander, FileChangeKind, FileChangeSummary};
@@ -568,6 +569,10 @@ impl FS for OverlayFS {
     // overlayfs.go:360
     fn realpath(&self, path: &str) -> String {
         self.host.fs().realpath(path)
+    }
+
+    fn realpath_memoized(&self, path: &str, memo: &RealpathMemo) -> String {
+        self.host.fs().realpath_memoized(path, memo)
     }
 }
 

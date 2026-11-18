@@ -3,6 +3,7 @@ use std::io;
 use std::sync::LazyLock;
 use std::time::SystemTime;
 
+use tsrs_core::collections::SyncMap;
 use tsrs_core::{stringutil, tspath};
 
 use crate::internal::{self, Common, IoDirEntry, IoFS, RootFor};
@@ -118,7 +119,11 @@ impl FS for OsFS {
     }
 
     fn realpath(&self, path: &str) -> String {
-        os_fs_realpath(path)
+        os_fs_realpath(path, None)
+    }
+
+    fn realpath_memoized(&self, path: &str, memo: &RealpathMemo) -> String {
+        os_fs_realpath(path, Some(memo))
     }
 
     fn write_file(&self, path: &str, content: &str) -> Result<(), String> {
@@ -186,7 +191,7 @@ fn user_cache_dir() -> Option<String> {
     non_empty("HOME").map(|home| home + "/.cache")
 }
 
-fn os_fs_realpath(path: &str) -> String {
+fn os_fs_realpath(path: &str, memo: Option<&RealpathMemo>) -> String {
     let _ = internal::root_length(path); // Assert path is rooted
 
     let orig = path;
@@ -194,7 +199,7 @@ fn os_fs_realpath(path: &str) -> String {
         return orig.to_string();
     }
     let path = from_slash(path);
-    let Ok(path) = native_realpath(&path) else {
+    let Ok(path) = native_realpath(&path, memo) else {
         return orig.to_string();
     };
     let Ok(path) = abs(&path) else {
@@ -216,12 +221,12 @@ fn from_slash(path: &str) -> String {
 // after an O_PATH open, which is what realpath(3) computes); elsewhere
 // filepath.EvalSymlinks, which resolves symlinks without correcting case.
 #[cfg(target_os = "linux")]
-fn native_realpath(path: &str) -> io::Result<String> {
+fn native_realpath(path: &str, _: Option<&RealpathMemo>) -> io::Result<String> {
     Ok(fs::canonicalize(path)?.to_string_lossy().into_owned())
 }
 
 #[cfg(windows)]
-pub(crate) fn native_realpath(path: &str) -> io::Result<String> {
+pub(crate) fn native_realpath(path: &str, _: Option<&RealpathMemo>) -> io::Result<String> {
     let p = fs::canonicalize(path)?.to_string_lossy().into_owned();
     if let Some(rest) = p.strip_prefix(r"\\?\UNC\") {
         return Ok(format!(r"\\{rest}"));
@@ -233,13 +238,78 @@ pub(crate) fn native_realpath(path: &str) -> io::Result<String> {
 }
 
 #[cfg(not(any(target_os = "linux", windows)))]
-fn native_realpath(path: &str) -> io::Result<String> {
-    walk_symlinks(path)
+fn native_realpath(path: &str, memo: Option<&RealpathMemo>) -> io::Result<String> {
+    walk_symlinks(path, memo)
+}
+
+// The lstat and readlink results of the realpath walk, by path, for later walks of the same cache generation. A walk
+// is a function of these results, so it returns what an uncached walk returns while the tree does not change; each
+// symlinked package directory under pnpm is otherwise met again by every path through it (results/fs/REPORT.md P1).
+// Linux and Windows resolve a path in one call and leave it empty.
+#[derive(Default)]
+pub struct RealpathMemo {
+    lstat: SyncMap<String, Result<Lstat, io::ErrorKind>>,
+    readlink: SyncMap<String, Result<String, io::ErrorKind>>,
+}
+
+impl RealpathMemo {
+    pub fn clear(&self) {
+        self.lstat.clear();
+        self.readlink.clear();
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    any(target_os = "linux", windows),
+    expect(dead_code, reason = "only the walk fills the memo")
+)]
+enum Lstat {
+    Dir,
+    Symlink,
+    Other,
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+fn lstat(path: &str, memo: Option<&RealpathMemo>) -> io::Result<Lstat> {
+    let os = || {
+        let file_type = fs::symlink_metadata(path)?.file_type();
+        Ok(if file_type.is_symlink() {
+            Lstat::Symlink
+        } else if file_type.is_dir() {
+            Lstat::Dir
+        } else {
+            Lstat::Other
+        })
+    };
+    let Some(memo) = memo else {
+        return os();
+    };
+    if let Some(known) = memo.lstat.load(path) {
+        return known.map_err(io::Error::from);
+    }
+    let result = os();
+    memo.lstat.store(path.to_string(), result.as_ref().copied().map_err(io::Error::kind));
+    result
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+fn readlink(path: &str, memo: Option<&RealpathMemo>) -> io::Result<String> {
+    let os = || Ok(fs::read_link(path)?.to_string_lossy().into_owned());
+    let Some(memo) = memo else {
+        return os();
+    };
+    if let Some(known) = memo.readlink.load(path) {
+        return known.map_err(io::Error::from);
+    }
+    let result = os();
+    memo.readlink.store(path.to_string(), result.as_ref().cloned().map_err(io::Error::kind));
+    result
 }
 
 // filepath.walkSymlinks (the Unix variant, used by filepath.EvalSymlinks).
 #[cfg(not(any(target_os = "linux", windows)))]
-fn walk_symlinks(path: &str) -> io::Result<String> {
+fn walk_symlinks(path: &str, memo: Option<&RealpathMemo>) -> io::Result<String> {
     let is_sep = |b: u8| b == b'/';
     let mut path = path.to_string();
     let mut vol_len = 0usize;
@@ -305,10 +375,10 @@ fn walk_symlinks(path: &str) -> io::Result<String> {
         dest.push_str(&path[start..end]);
 
         // Resolve symlink.
-        let fi = fs::symlink_metadata(&dest)?;
+        let fi = lstat(&dest, memo)?;
 
-        if !fi.file_type().is_symlink() {
-            if !fi.is_dir() && end < path.len() {
+        if fi != Lstat::Symlink {
+            if fi != Lstat::Dir && end < path.len() {
                 return Err(io::Error::from_raw_os_error(20 /* ENOTDIR */));
             }
             start = end;
@@ -322,7 +392,7 @@ fn walk_symlinks(path: &str) -> io::Result<String> {
             return Err(io::Error::other("EvalSymlinks: too many links"));
         }
 
-        let link = fs::read_link(&dest)?.to_string_lossy().into_owned();
+        let link = readlink(&dest, memo)?;
 
         path = format!("{}{}", link, &path[end..]);
 
