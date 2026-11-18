@@ -1347,7 +1347,7 @@ impl DirWatch {
         &self,
         path: &str,
         seq: u64,
-        err: &Error,
+        err: fn() -> Error,
     ) -> bool {
         let mut st = self.mu.lock().unwrap();
         let mut changed = false;
@@ -1357,22 +1357,25 @@ impl DirWatch {
             cache: Some(&comparisons),
             ..Default::default()
         };
+        // tsrs-only: every callback of a watch has the watch's directories (`add_callback`), so the deleted path has
+        // one physical form for all of them. The callbacks' prepared directories are compared in place: copies took
+        // 5 allocations per callback and deleted path, and a consolidated node_modules watch has over a hundred.
+        let physical_path = st.callbacks.first().map(|cb| ComparisonPath {
+            path: cb.event_physical_path(path),
+            cache: Some(&comparisons),
+            ..Default::default()
+        });
         for cb in &mut st.callbacks {
             if cb.delivered || cb.terminal.is_some() || cb.since_seq >= seq {
                 continue;
             }
-            let physical_path = ComparisonPath {
-                path: cb.event_physical_path(path),
-                cache: Some(&comparisons),
-                ..Default::default()
-            };
-            let (mut dir, mut physical) =
-                (cb.dir_comparison.clone(), cb.physical_comparison.clone());
-            let logical_match = cb.comparer.suffix_prepared(&deleted, &mut dir).is_some();
-            let physical_match =
-                cb.comparer.suffix_prepared(&physical_path, &mut physical).is_some();
+            let logical_match =
+                cb.comparer.suffix_prepared(&deleted, &mut cb.dir_comparison).is_some();
+            let physical_match = physical_path.as_ref().is_some_and(|physical_path| {
+                cb.comparer.suffix_prepared(physical_path, &mut cb.physical_comparison).is_some()
+            });
             if logical_match || physical_match {
-                cb.terminal = Some(err.clone());
+                cb.terminal = Some(err());
                 changed = true;
             }
         }

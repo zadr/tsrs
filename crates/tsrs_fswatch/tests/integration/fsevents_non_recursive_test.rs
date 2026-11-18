@@ -399,3 +399,73 @@ fn a_drop_on_a_stream_with_a_recursive_watch_overflows() {
     shallow.watch.destroy_debounce_for_test();
     deep.watch.destroy_debounce_for_test();
 }
+
+#[test]
+fn deleting_a_callbacks_directory_terminates_only_that_callback() {
+    let f = Fixture::new("terminate");
+    for dir in ["sub2", "other", "keep"] {
+        std::fs::create_dir(f.path(dir)).unwrap();
+    }
+    std::os::unix::fs::symlink(f.path("sub2"), f.path("link")).unwrap();
+    let db = Debounce::new_without_loop_for_test();
+    let watched = Watched::new(&f.root, &f.root, true, &db);
+    // (callback directory, its physical directory)
+    let dirs = [
+        (f.path("sub"), f.path("sub")),
+        (f.path("link"), f.path("sub2")),
+        (f.path("other"), f.path("other")),
+        (f.path("keep"), f.path("keep")),
+    ];
+    let results: Vec<Delivered> = dirs
+        .iter()
+        .map(|(dir, physical)| {
+            let delivered: Delivered = Arc::default();
+            let sink = Arc::clone(&delivered);
+            watched.watch.add_callback(
+                dir,
+                physical,
+                true,
+                Arc::new(move |_, err| sink.lock().unwrap().push((Vec::new(), err))),
+                None,
+                "",
+            );
+            delivered
+        })
+        .collect();
+    let terminated = |i: usize| {
+        results[i]
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, err)| err.as_ref().is_some_and(|e| e.is(ERR_WATCH_TERMINATED)))
+    };
+    let cb = stream(&[&watched]);
+    let symlink = 0x0004_0000;
+
+    // A file below a callback's directory, and one beside it.
+    dispatch_test_events(
+        &cb,
+        &[
+            (&f.path("sub/file.ts"), FLAG_ITEM_REMOVED | FILE),
+            (&f.path("KEEP.ts"), FLAG_ITEM_REMOVED | FILE),
+        ],
+    );
+    watched.fire();
+    assert!((0..4).all(|i| !terminated(i)));
+
+    // The directory itself, the symlink a callback watches through, the symlink's target in a different case.
+    dispatch_test_events(&cb, &[(&f.path("sub"), FLAG_ITEM_REMOVED | DIR)]);
+    watched.fire();
+    assert!(terminated(0) && !terminated(1) && !terminated(2) && !terminated(3));
+    dispatch_test_events(&cb, &[(&f.path("link"), FLAG_ITEM_REMOVED | symlink)]);
+    watched.fire();
+    assert!(terminated(1) && !terminated(2) && !terminated(3));
+    dispatch_test_events(&cb, &[(&f.path("OTHER"), FLAG_ITEM_REMOVED | DIR)]);
+    watched.fire();
+    assert!(terminated(2) && !terminated(3));
+    // A deletion without a type, which may have been a directory.
+    dispatch_test_events(&cb, &[(&f.root, FLAG_ITEM_REMOVED)]);
+    watched.fire();
+    assert!(terminated(3));
+    watched.watch.destroy_debounce_for_test();
+}

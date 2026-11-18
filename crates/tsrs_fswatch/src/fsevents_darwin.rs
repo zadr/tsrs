@@ -725,6 +725,10 @@ impl<'w> Batch<'w> {
         let is_removed = flag & FLAG_ITEM_REMOVED != 0;
         let is_renamed = flag & FLAG_ITEM_RENAMED != 0;
         let is_created = flag & FLAG_ITEM_CREATED != 0;
+        // tsrs-only: only a directory, or a symlink to one, can be the directory of a callback, and FSEvents gives an
+        // item event the type of its item, so a deleted file terminates no callback.
+        let may_be_directory =
+            flag & (FLAG_ITEM_IS_DIR | FLAG_ITEM_IS_SYMLINK) != 0 || flag & FLAG_ITEM_IS_FILE == 0;
 
         let raw_path = path;
         // tsrs-only: one lstat answers both the write settling below and whether a renamed path exists (an atomic save
@@ -792,11 +796,13 @@ impl<'w> Batch<'w> {
                 } else {
                     w.events.remove_at(&display_path, event_id);
                 }
-                if w.terminate_callbacks_for_deleted_root(
-                    &display_path,
-                    event_id,
-                    &err_watched_directory_removed(),
-                ) {
+                if may_be_directory
+                    && w.terminate_callbacks_for_deleted_root(
+                        &display_path,
+                        event_id,
+                        err_watched_directory_removed,
+                    )
+                {
                     self.touch(w);
                 }
                 if display_path == w.dir {
@@ -816,11 +822,13 @@ impl<'w> Batch<'w> {
                     } else {
                         w.events.remove_at(&display_path, event_id);
                     }
-                    if w.terminate_callbacks_for_deleted_root(
-                        &display_path,
-                        event_id,
-                        &err_watched_directory_removed(),
-                    ) {
+                    if may_be_directory
+                        && w.terminate_callbacks_for_deleted_root(
+                            &display_path,
+                            event_id,
+                            err_watched_directory_removed,
+                        )
+                    {
                         self.touch(w);
                     }
                     if display_path == w.dir {
