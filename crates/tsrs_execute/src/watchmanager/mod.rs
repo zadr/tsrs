@@ -337,13 +337,14 @@ impl WatchManager {
     }
 
     /// Go `ReconcileWatches`: open the missing watches, close the stale ones, recreate those whose recursion changed.
+    /// tsrs-only: returns the watches it opened.
     pub(crate) fn reconcile_watches(
         self: &Arc<Self>,
         state: &mut WatchState,
         desired_dirs: &FxHashMap<String, bool>,
-    ) -> Result<(), Error> {
+    ) -> Result<Vec<(String, bool)>, Error> {
         if state.backend.is_none() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let mut additions: Vec<(String, bool)> = Vec::new();
         let mut changes: Vec<(String, bool)> = Vec::new();
@@ -389,9 +390,9 @@ impl WatchManager {
         self: &Arc<Self>,
         state: &mut WatchState,
         updates: Vec<(String, bool)>,
-    ) -> Result<(), Error> {
+    ) -> Result<Vec<(String, bool)>, Error> {
         if updates.is_empty() {
-            return Ok(());
+            return Ok(updates);
         }
         let mut ids = Vec::with_capacity(updates.len());
         let mut requests = Vec::with_capacity(updates.len());
@@ -403,12 +404,13 @@ impl WatchManager {
         let backend = Arc::clone(state.backend.as_ref().expect("checked by reconcile_watches"));
         match backend.watch_directories(requests) {
             Ok(closers) => {
-                for (((dir, recursive), id), closer) in updates.into_iter().zip(ids).zip(closers) {
-                    state
-                        .watched_dirs
-                        .insert(dir, WatchedDir { closer: Some(closer), recursive, id });
+                for (((dir, recursive), id), closer) in updates.iter().zip(ids).zip(closers) {
+                    state.watched_dirs.insert(
+                        dir.clone(),
+                        WatchedDir { closer: Some(closer), recursive: *recursive, id },
+                    );
                 }
-                Ok(())
+                Ok(updates)
             }
             Err(err) => {
                 for (dir, _) in &updates {

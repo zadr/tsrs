@@ -10,7 +10,7 @@ use rustc_hash::FxHashMap;
 
 use super::{
     LATE_EVENT_WRITE, OVERFLOW, REMOVE_UNTYPED_DIRECTORY, Scenario, ScenarioEdit, ScenarioFile,
-    ScenarioOp, WRITE_SAME_TIME, run_scenario,
+    ScenarioOp, WRITE_BEFORE_WATCH, WRITE_SAME_TIME, run_scenario,
 };
 
 const LIB_FILE: &str = "/home/src/tslibs/TS/Lib/lib.esnext.full.d.ts";
@@ -567,6 +567,40 @@ fn an_overflow_rebuild_reads_again_only_files_that_may_have_changed() {
     assert!(overflow_cycle.contains("TS2322"), "{baseline}");
 }
 
+// A cycle reads a file in a directory it watches only from its end; a save in between has no event. The cycle compares
+// the modification times of the files under its new watches with those it read, and the next cycle builds the save.
+#[test]
+fn a_save_before_its_directory_is_watched_is_built_by_the_next_cycle() {
+    let baseline = run_expecting(
+        "save-before-watch",
+        &["-w", "-p", "app"],
+        vec![
+            file(
+                &format!("{ROOT}/app/tsconfig.json"),
+                r#"{ "compilerOptions": { "target": "esnext", "noEmit": true } }"#,
+            ),
+            file(&format!("{ROOT}/app/main.ts"), "export const m = 1;\n"),
+            file(&format!("{ROOT}/extra/b.ts"), "export const b: number = 1;\n"),
+        ],
+        vec![
+            (
+                "import a file of an unwatched directory, saved before the directory is watched",
+                vec![
+                    write(
+                        "app/main.ts",
+                        "import { b } from \"../extra/b\";\nexport const m = b;\n",
+                    ),
+                    write_before_watch("extra/b.ts", "export const b: number = 's';\n"),
+                ],
+                Cycle::Late,
+            ),
+            ("no edit", vec![], Cycle::Runs),
+        ],
+        Harness::default(),
+    );
+    assert!(baseline.contains("TS2322"), "{baseline}");
+}
+
 // Runs `tsgo <args>` on `files` (paths under ROOT), asserts that no edit differs from a fresh build, and returns the
 // baseline. An edit that only touches files starts no cycle: its output is empty, unlike a fresh build's.
 fn run(
@@ -719,6 +753,15 @@ fn write(path: &str, content: &str) -> ScenarioOp {
 fn write_same_time(path: &str, content: &str) -> ScenarioOp {
     ScenarioOp {
         op: WRITE_SAME_TIME.to_string(),
+        path: format!("{ROOT}/{path}"),
+        content: content.to_string(),
+        target: String::new(),
+    }
+}
+
+fn write_before_watch(path: &str, content: &str) -> ScenarioOp {
+    ScenarioOp {
+        op: WRITE_BEFORE_WATCH.to_string(),
         path: format!("{ROOT}/{path}"),
         content: content.to_string(),
         target: String::new(),

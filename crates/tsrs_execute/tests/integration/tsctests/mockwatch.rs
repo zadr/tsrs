@@ -38,6 +38,8 @@ pub struct FileChange {
 pub struct MockWatchBackend {
     // The mock keeps closed watches (Go: `Dirs`), so "is watched" checks the closed flag.
     dirs: Mutex<FxHashMap<String, MockWatch>>,
+    // tsrs-only: runs when the next watches start (`WRITE_BEFORE_WATCH`).
+    before_next_watch: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     directory_exists: Box<dyn Fn(&str) -> bool + Send + Sync>,
     use_case_sensitive_file_names: bool,
 }
@@ -49,8 +51,21 @@ impl MockWatchBackend {
     ) -> MockWatchBackend {
         MockWatchBackend {
             dirs: Mutex::new(FxHashMap::default()),
+            before_next_watch: Mutex::new(None),
             directory_exists,
             use_case_sensitive_file_names,
+        }
+    }
+
+    pub(crate) fn before_next_watch(&self, f: Box<dyn FnOnce() + Send>) {
+        *self.before_next_watch.lock().unwrap() = Some(f);
+    }
+
+    /// Runs what waits for the next watches now, if none started.
+    pub(crate) fn run_before_next_watch(&self) {
+        let f = self.before_next_watch.lock().unwrap().take();
+        if let Some(f) = f {
+            f();
         }
     }
 
@@ -169,6 +184,7 @@ impl WatchBackend for MockWatchBackend {
         &self,
         requests: Vec<WatchDirectoryRequest>,
     ) -> Result<Vec<Box<dyn Watch>>, Error> {
+        self.run_before_next_watch();
         let mut dirs = self.dirs.lock().unwrap();
         if let Some(missing) = requests.iter().find(|r| !(self.directory_exists)(&r.dir)) {
             return Err(Error::new(format!("directory does not exist: {}", missing.dir)));

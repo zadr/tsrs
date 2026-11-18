@@ -299,27 +299,42 @@ impl Watcher {
         if self.do_build(&mut state, build_start).is_err() {
             wm.force_overflow();
         }
-        if self.testing.is_none() {
-            self.queue_files_changed_during_build();
-        }
     }
 
-    // tsrs-only: the watches start after the first build, so a file saved while that build ran (after it was read)
-    // has no event; Go misses the edit until the next save (tsgo too). A file whose modification time is no longer
-    // the one it was parsed at is queued as a change, and the first cycle picks it up. One stat per source file
-    // (about 15 ms for 9k files), once.
-    fn queue_files_changed_during_build(&self) {
+    // tsrs-only: a directory is watched from the end of the build that first reads a file in it (every directory, for
+    // the first build), so a file saved while that build ran, after it was read, has no event; Go misses the edit until
+    // the next save (tsgo too). A file under a new watch (`None`: any file) whose modification time is no longer the one
+    // it was parsed at is queued as a change, and the next cycle picks it up. One stat per such file (about 15 ms for 9k
+    // files after the first build).
+    fn queue_files_changed_during_build(&self, new_watches: Option<&[(String, bool)]>) {
+        let new_watches: Option<Vec<(Path, bool)>> = new_watches.map(|watches| {
+            watches.iter().map(|(dir, recursive)| (self.to_path(dir), *recursive)).collect()
+        });
+        if new_watches.as_ref().is_some_and(Vec::is_empty) {
+            return;
+        }
+        let under_new_watch = |path: &Path| {
+            new_watches.as_ref().is_none_or(|watches| {
+                watches.iter().any(|(dir, recursive)| {
+                    if *recursive {
+                        dir.contains_path(path)
+                    } else {
+                        path.get_directory_path() == *dir
+                    }
+                })
+            })
+        };
         let fs = self.sys.fs();
         let mut changed: Vec<String> = Vec::new();
-        for path in self.source_file_cache.keys() {
-            let Some(cached) = self.source_file_cache.load(&path) else {
-                continue;
-            };
+        self.source_file_cache.range(|path, cached| {
             let file_name = cached.file.file_name();
-            if fs.stat(file_name).map(|s| s.mod_time()) != Some(cached.mod_time) {
+            if under_new_watch(path)
+                && fs.stat(file_name).map(|s| s.mod_time()) != Some(cached.mod_time)
+            {
                 changed.push(file_name.to_string());
             }
-        }
+            true
+        });
         if !changed.is_empty() {
             changed.sort();
             self.wm.debug(|| {
@@ -477,11 +492,12 @@ impl Watcher {
         self.wm.resolve_desired_dirs(&coverage.dirs())
     }
 
+    // Returns the watches it started.
     fn reconcile_watches(
         &self,
         state: &mut WatchState,
         seen_file_paths: &[String],
-    ) -> Result<(), tsrs_fswatch::Error> {
+    ) -> Result<Vec<(String, bool)>, tsrs_fswatch::Error> {
         let desired_dirs = self.compute_desired_watches(seen_file_paths);
         self.wm.reconcile_watches(state, &desired_dirs)
     }
@@ -845,6 +861,7 @@ impl Watcher {
         program_options.regions = Some(Arc::clone(&regions));
         let program = new_program(program_options);
         self.install_program(program, host, Some(regions));
+        let first_build = !self.program_ready;
         self.program_ready = true;
         self.full_builds += 1;
 
@@ -857,13 +874,17 @@ impl Watcher {
         self.own_outputs = self.compute_own_outputs();
         self.record_config_mtimes();
 
-        if let Err(err) = self.reconcile_watches(state, &seen) {
-            self.sys.write(&format!("{}\n", err.message()));
-            // tsrs-only: the build's diagnostics and status line still go out (Go returns here and prints neither);
-            // the status line also flushes the output, which would otherwise hold the error until the next cycle.
-            self.report_error_count(result.diagnostics.len());
-            return Err(err);
-        }
+        let new_watches = match self.reconcile_watches(state, &seen) {
+            Ok(new_watches) => new_watches,
+            Err(err) => {
+                self.sys.write(&format!("{}\n", err.message()));
+                // tsrs-only: the build's diagnostics and status line still go out (Go returns here and prints
+                // neither); the status line also flushes the output, which would otherwise hold the error until the
+                // next cycle.
+                self.report_error_count(result.diagnostics.len());
+                return Err(err);
+            }
+        };
         self.watch_set_dirty = false;
         self.config_modified = false;
         self.force_full_rebuild = false;
@@ -878,6 +899,7 @@ impl Watcher {
         self.report_error_count(result.diagnostics.len());
         self.free_replaced_program();
         self.start_signature_job();
+        self.queue_files_changed_during_build((!first_build).then_some(new_watches.as_slice()));
         if let Some(testing) = self.testing {
             testing.on_program(self.program.unwrap());
         }

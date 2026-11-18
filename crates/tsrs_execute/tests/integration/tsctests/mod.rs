@@ -38,6 +38,7 @@ struct ScenarioFile {
     symlink: String,
 }
 
+#[derive(Clone)]
 struct ScenarioOp {
     op: String,
     path: String,
@@ -238,11 +239,17 @@ pub const OVERFLOW: &str = "overflow";
 /// tsrs-only: a write that keeps the file's modification time, as a second write in the same unit of time does.
 pub const WRITE_SAME_TIME: &str = "writeSameTime";
 
-fn apply_ops(sys: &TestSys, ops: &[ScenarioOp]) {
+/// tsrs-only: a write made while the cycle runs, after its build read the file and before the watch of the file's
+/// directory starts; no event reports it.
+pub const WRITE_BEFORE_WATCH: &str = "writeBeforeWatch";
+
+fn apply_ops<'a>(sys: &TestSys, ops: impl IntoIterator<Item = &'a ScenarioOp>) {
     let fs = sys.fs_from_file_map();
     for op in ops {
         match op.op.as_str() {
-            "write" | LATE_EVENT_WRITE => fs.write_file(&op.path, &op.content).unwrap(),
+            "write" | LATE_EVENT_WRITE | WRITE_BEFORE_WATCH => {
+                fs.write_file(&op.path, &op.content).unwrap();
+            }
             "delete" | REMOVE_UNTYPED_DIRECTORY => fs.remove(&op.path).unwrap(),
             OVERFLOW => {}
             WRITE_SAME_TIME => {
@@ -374,11 +381,14 @@ fn run_scenario(test: &Scenario) -> String {
     sys.baseline_programs(&mut baseline, "Initial build");
 
     let mut late_changes: Vec<mockwatch::FileChange> = Vec::new();
+    let mut unreported: FxHashSet<String> = FxHashSet::default();
     for (index, edit) in test.edits.iter().enumerate() {
         sys.clear_output();
         let args = edit.args.clone().unwrap_or_else(|| test.args.clone());
         write!(baseline, "\n\nEdit [{}]:: {}\n", index, edit.caption).unwrap();
-        apply_ops(sys, &edit.ops);
+        let (before_watch, ops): (Vec<&ScenarioOp>, Vec<&ScenarioOp>) =
+            edit.ops.iter().partition(|op| op.op == WRITE_BEFORE_WATCH);
+        apply_ops(sys, ops);
         let late: FxHashSet<&str> = edit
             .ops
             .iter()
@@ -387,6 +397,8 @@ fn run_scenario(test: &Scenario) -> String {
             .collect();
         let (deferred, mut changed_paths): (Vec<_>, Vec<_>) =
             sys.changed_paths().into_iter().partition(|change| late.contains(change.path.as_str()));
+        changed_paths.retain(|change| !unreported.contains(&change.path));
+        unreported = before_watch.iter().map(|op| op.path.clone()).collect();
         changed_paths.extend(std::mem::replace(&mut late_changes, deferred));
         for op in edit.ops.iter().filter(|op| op.op == REMOVE_UNTYPED_DIRECTORY) {
             let below = format!("{}/", op.path);
@@ -400,6 +412,7 @@ fn run_scenario(test: &Scenario) -> String {
         sys.baseline_fs_with_diff(&mut baseline);
         match &mut watcher {
             None => {
+                apply_ops(sys, before_watch);
                 execute_command(sys, &mut baseline, &args);
             }
             Some(watcher) => {
@@ -409,8 +422,11 @@ fn run_scenario(test: &Scenario) -> String {
                 } else {
                     backend.send_changed_paths(&changed_paths, !test.file_events_only);
                 }
+                let before_watch: Vec<ScenarioOp> = before_watch.into_iter().cloned().collect();
+                backend.before_next_watch(Box::new(move || apply_ops(sys, &before_watch)));
                 sys.fs.reads.lock().unwrap().clear();
                 watcher.do_cycle();
+                backend.run_before_next_watch();
                 if test.report_reads {
                     let mut reads = std::mem::take(&mut *sys.fs.reads.lock().unwrap());
                     reads.sort();
