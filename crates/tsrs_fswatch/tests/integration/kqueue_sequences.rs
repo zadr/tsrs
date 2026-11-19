@@ -121,14 +121,14 @@ impl Kq {
         let mut disk = vec![w.dir.clone()];
         list(&w.dir, recursive, &mut disk);
         let st = self.backend.mu.lock().unwrap();
-        let map_ids: Vec<_> = st.subs_by_path[&w.dir]
-            .iter()
-            .filter(|s| Arc::ptr_eq(&s.dir_watch, w))
-            .map(|s| s.entries)
+        let maps: Vec<_> = st
+            .entry_maps
+            .values()
+            .filter(|m| m.watch.as_ref().is_some_and(|x| Arc::ptr_eq(x, w)))
             .collect();
-        assert_eq!(map_ids.len(), 1);
+        assert_eq!(maps.len(), 1);
         let entries: Vec<(String, Option<i32>)> =
-            st.entry_maps[&map_ids[0]].values().map(|e| (e.path.clone(), e.state)).collect();
+            maps[0].values().map(|e| (e.path.to_string(), e.state)).collect();
         drop(st);
         for (path, fd) in &entries {
             assert!(disk.contains(path), "{path} is gone but still watched");

@@ -1248,6 +1248,7 @@ dependencies = [
  "hashbrown",
  "libc",
  "rustc-hash",
+ "smallvec",
  "tsrs_core",
 ]
 

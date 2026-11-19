@@ -4,9 +4,7 @@ use std::os::fd::IntoRawFd;
 use std::sync::Arc;
 
 use tsrs_fswatch::debounce::Debounce;
-use tsrs_fswatch::kqueue::{
-    DirEntry, EntriesID, EntryMap, KqueueBackend, KqueueSubscription, new_kqueue_backend,
-};
+use tsrs_fswatch::kqueue::{DirEntry, EntriesID, EntryMap, KqueueBackend, new_kqueue_backend};
 use tsrs_fswatch::pathcompare::BytePathComparer;
 use tsrs_fswatch::watcher::{DirWatch, WatcherImpl};
 
@@ -21,27 +19,13 @@ fn is_open(fd: i32) -> bool {
 
 fn insert_watch(backend: &KqueueBackend, watch: &Arc<DirWatch>, map_id: EntriesID) -> i32 {
     let fd = open_fd();
-    let path = watch.dir.clone();
+    let mut entries = EntryMap::with_capacity(watch, 1);
+    let mut entry = DirEntry::new(watch.dir.clone(), watch.dir.clone(), false, 0);
+    entry.state = Some(fd);
+    let node = entries.insert(entry, 0);
     let mut st = backend.mu.lock().unwrap();
-    let mut entries = EntryMap::default();
-    entries.insert(
-        DirEntry {
-            path: path.clone(),
-            watch_path: path.clone(),
-            is_dir: false,
-            state: Some(fd),
-            ino: 0,
-        },
-        0,
-    );
-    st.entry_maps.insert(map_id, entries);
-    st.fd_to_entry.insert(fd, (map_id, path.clone(), 0));
-    st.subs_by_path.entry(path.clone()).or_default().push(KqueueSubscription {
-        id: backend.next_id(),
-        dir_watch: Arc::clone(watch),
-        path,
-        entries: map_id,
-    });
+    st.insert_map(map_id, entries);
+    st.fd_to_entry.insert(fd, (map_id, node, 0));
     fd
 }
 
@@ -89,7 +73,8 @@ fn closing_watches_owns_only_current_entry_descriptors() {
         {
             let mut st = backend.mu.lock().unwrap();
             st.set_entry_state(1, &watch.dir, Some(replacement));
-            st.fd_to_entry.insert(replacement, (1, watch.dir.clone(), 0));
+            let node = st.entry_maps[&1].id(&watch.dir).unwrap();
+            st.fd_to_entry.insert(replacement, (1, node, 0));
         }
         if shutdown {
             backend.close_subscriptions();
