@@ -203,3 +203,154 @@ fn vim_save_keeps_the_file_watched() {
         );
     }
 }
+
+type Step = fn(&Kq);
+
+// a.ts b.ts sub/c.ts sub/deep/d.ts other/ link -> a.ts dirlink -> sub
+fn tree(kq: &Kq) {
+    std::fs::create_dir_all(kq.path("sub/deep")).unwrap();
+    std::fs::create_dir_all(kq.path("other")).unwrap();
+    for f in ["a.ts", "b.ts", "sub/c.ts", "sub/deep/d.ts"] {
+        write(&kq.path(f), "export {};\n");
+    }
+    std::os::unix::fs::symlink("a.ts", kq.path("link")).unwrap();
+    std::os::unix::fs::symlink("sub", kq.path("dirlink")).unwrap();
+}
+
+const SEQUENCES: &[(&str, Step)] = &[
+    ("atomic-save", |kq| {
+        write(&kq.path("a.ts.tmp"), "export const a = 1;\n");
+        std::fs::rename(kq.path("a.ts.tmp"), kq.path("a.ts")).unwrap();
+    }),
+    ("in-place", |kq| write(&kq.path("sub/c.ts"), "export const c = 1;\n")),
+    ("create-delete-same-batch", |kq| {
+        write(&kq.path("tmp.ts"), "x");
+        std::fs::remove_file(kq.path("tmp.ts")).unwrap();
+    }),
+    ("create-dir-tree", |kq| {
+        std::fs::create_dir_all(kq.path("new/x/y")).unwrap();
+        write(&kq.path("new/x/y/e.ts"), "x");
+        write(&kq.path("new/f.ts"), "x");
+    }),
+    ("rm-rf", |kq| std::fs::remove_dir_all(kq.path("sub")).unwrap()),
+    ("rename-file-across", |kq| {
+        std::fs::rename(kq.path("sub/c.ts"), kq.path("other/c.ts")).unwrap();
+    }),
+    ("rename-dir-across", |kq| {
+        std::fs::rename(kq.path("sub/deep"), kq.path("other/deep")).unwrap();
+    }),
+    ("dir-replaced-by-file", |kq| {
+        std::fs::remove_dir_all(kq.path("sub")).unwrap();
+        write(&kq.path("sub"), "x");
+    }),
+    ("file-replaced-by-dir", |kq| {
+        std::fs::remove_file(kq.path("b.ts")).unwrap();
+        std::fs::create_dir(kq.path("b.ts")).unwrap();
+        write(&kq.path("b.ts/x.ts"), "x");
+    }),
+    ("dir-renamed-over-empty-dir", |kq| {
+        std::fs::create_dir(kq.path("other/deep")).unwrap();
+        write(&kq.path("other/deep/z.ts"), "x");
+        std::fs::rename(kq.path("other/deep"), kq.path("sub/deep2")).unwrap();
+        std::fs::remove_dir(kq.path("sub/deep2")).unwrap_or_default();
+    }),
+    ("symlink-retarget", |kq| {
+        std::os::unix::fs::symlink("b.ts", kq.path("link2")).unwrap();
+        std::fs::rename(kq.path("link2"), kq.path("link")).unwrap();
+    }),
+    ("unrelated-create-beside-links", |kq| write(&kq.path("other.ts"), "x")),
+    ("case-only-rename", |kq| std::fs::rename(kq.path("a.ts"), kq.path("A.ts")).unwrap()),
+    ("non-ascii-nfc-to-nfd", |kq| {
+        write(&kq.path("caf\u{e9}.ts"), "x");
+        std::fs::rename(kq.path("caf\u{e9}.ts"), kq.path("cafe\u{301}.ts")).unwrap();
+    }),
+    ("hard-link-then-atomic-save", |kq| {
+        std::fs::hard_link(kq.path("a.ts"), kq.path("hl.ts")).unwrap();
+        write(&kq.path("a.ts.tmp"), "y");
+        std::fs::rename(kq.path("a.ts.tmp"), kq.path("a.ts")).unwrap();
+    }),
+    ("swap-two-files", |kq| {
+        std::fs::rename(kq.path("a.ts"), kq.path("t.ts")).unwrap();
+        std::fs::rename(kq.path("b.ts"), kq.path("a.ts")).unwrap();
+        std::fs::rename(kq.path("t.ts"), kq.path("b.ts")).unwrap();
+    }),
+    ("vim-save", |kq| {
+        write(&kq.path(".a.ts.swp"), "swap");
+        std::fs::rename(kq.path("a.ts"), kq.path("a.ts~")).unwrap();
+        write(&kq.path("a.ts"), "export const a = 1;\n");
+        std::fs::remove_file(kq.path("a.ts~")).unwrap();
+        std::fs::remove_file(kq.path(".a.ts.swp")).unwrap();
+    }),
+];
+
+// After each sequence, in either batch order: every watch holds exactly the paths on disk, each through a descriptor
+// on the current file. The events of the sequence and of a following in-place edit of every regular file are pinned
+// in kqueue_sequences.txt (recorded before the backend's maps were restructured).
+#[test]
+fn sequences_keep_every_path_watched() {
+    let mut report = Vec::new();
+    for (name, step) in SEQUENCES {
+        for dirs_first in [true, false] {
+            let kq = Kq::new(&format!("{name}-{dirs_first}"));
+            tree(&kq);
+            let watches = [("root", "", true), ("sub", "sub", true), ("flat", "", false)];
+            let ws: Vec<(&str, Arc<DirWatch>, bool)> = watches
+                .iter()
+                .map(|(label, rel, rec)| (*label, kq.watch(rel, *rec), *rec))
+                .collect();
+            step(&kq);
+            kq.settle(dirs_first);
+            for (label, w, recursive) in &ws {
+                report.push(format!("{name} dirs_first={dirs_first} {label}: {:?}", kq.take(w)));
+                if std::path::Path::new(&w.dir).is_dir() {
+                    kq.assert_watching_disk(w, *recursive);
+                }
+            }
+            let mut files = Vec::new();
+            list(&kq.root, true, &mut files);
+            files.sort();
+            for p in files {
+                if std::fs::symlink_metadata(&p).unwrap().is_file() {
+                    let mut data = std::fs::read(&p).unwrap();
+                    data.push(b'\n');
+                    std::fs::write(&p, data).unwrap();
+                }
+            }
+            kq.settle(dirs_first);
+            for (label, w, _) in &ws {
+                report.push(format!(
+                    "{name} dirs_first={dirs_first} {label} edits: {:?}",
+                    kq.take(w)
+                ));
+            }
+        }
+    }
+    let want: Vec<&str> = include_str!("kqueue_sequences.txt").lines().collect();
+    for (got, want) in report.iter().zip(&want) {
+        assert_eq!(got, want);
+    }
+    assert_eq!(report.len(), want.len());
+}
+
+// Closing one of two overlapping watches leaves the other watching through its own descriptors; closing both
+// leaves no descriptor open.
+#[test]
+fn closing_an_overlapping_watch_keeps_the_other() {
+    let kq = Kq::new("close-overlap");
+    tree(&kq);
+    let outer = kq.watch("", true);
+    let inner = kq.watch("sub", true);
+    kq.backend.close_watch(&outer).unwrap();
+    write(&kq.path("sub/c.ts"), "export const c = 2;\n");
+    write(&kq.path("sub/new.ts"), "x");
+    std::fs::remove_file(kq.path("sub/deep/d.ts")).unwrap();
+    kq.settle(true);
+    assert_eq!(kq.take(&outer), Vec::<String>::new());
+    assert_eq!(
+        kq.take(&inner),
+        lines(&["delete sub/deep/d.ts", "update sub/c.ts", "update sub/new.ts"])
+    );
+    kq.assert_watching_disk(&inner, true);
+    kq.backend.close_watch(&inner).unwrap();
+    assert!(kq.backend.mu.lock().unwrap().fd_to_entry.is_empty());
+}
