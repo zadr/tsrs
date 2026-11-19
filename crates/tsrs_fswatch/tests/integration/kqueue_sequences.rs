@@ -57,6 +57,12 @@ impl Kq {
 
     // Reads every pending event, puts directories' events first or last, and handles them as one batch.
     fn settle(&self, dirs_first: bool) {
+        self.settle_filtered(dirs_first, false);
+    }
+
+    // As `settle`; with `dirs_only` the files' events are dropped, as on a kernel that posts nothing to a file
+    // replaced by a rename (DragonFly).
+    fn settle_filtered(&self, dirs_first: bool, dirs_only: bool) {
         let mut batch = Vec::new();
         // SAFETY: zeroed kevent structs are valid.
         let mut events: Vec<libc::kevent> = vec![unsafe { std::mem::zeroed() }; 256];
@@ -70,6 +76,9 @@ impl Kq {
         }
         let dir_fds = self.dir_fds();
         batch.sort_by_key(|ev| dir_fds.contains(&(ev.ident as i32)) != dirs_first);
+        if dirs_only {
+            batch.retain(|ev| dir_fds.contains(&(ev.ident as i32)));
+        }
         self.backend.handle_events(&batch, &mut Vec::new());
     }
 
@@ -330,6 +339,24 @@ fn sequences_keep_every_path_watched() {
         assert_eq!(got, want);
     }
     assert_eq!(report.len(), want.len());
+}
+
+// A file replaced under its path is noticed from its directory's event alone, through the listing; the outcomes
+// were recorded with the fstat and lstat comparison this test was written against.
+#[test]
+fn replacements_are_seen_from_the_directory_event() {
+    let mut report = Vec::new();
+    for (name, step) in SEQUENCES {
+        let kq = Kq::new(&format!("dirs-only-{name}"));
+        tree(&kq);
+        let w = kq.watch("", true);
+        step(&kq);
+        kq.settle_filtered(true, true);
+        report.push(format!("{name}: {:?}", kq.take(&w)));
+        kq.assert_watching_disk(&w, true);
+    }
+    let want: Vec<&str> = include_str!("kqueue_sequences_dirs_only.txt").lines().collect();
+    assert_eq!(report, want);
 }
 
 // Closing one of two overlapping watches leaves the other watching through its own descriptors; closing both
