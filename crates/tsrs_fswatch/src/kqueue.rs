@@ -142,6 +142,20 @@ fn kevent_register(kq: i32, ev: &libc::kevent) -> Result<(), Error> {
     Ok(())
 }
 
+// tsrs-only: each registration carries its own token in `udata`. Closing an fd drops its pending events in the
+// kernel, but not those already returned in the batch being handled; once the fd number is reused, such an event
+// would otherwise apply to the new registration.
+fn watch_fd(kq: i32, fd: i32, token: usize) -> Result<(), Error> {
+    let mut ev = new_kevent(
+        fd,
+        libc::EVFILT_VNODE,
+        libc::EV_ADD | libc::EV_CLEAR | libc::EV_ENABLE,
+        VNODE_FFLAGS,
+    );
+    ev.udata = token as _;
+    kevent_register(kq, &ev)
+}
+
 // dirEntry tracks a watched path for kqueue's fd↔path mapping.
 #[derive(Clone)]
 pub struct DirEntry {
@@ -164,7 +178,8 @@ pub struct KqueueSubscription {
 #[derive(Default)]
 pub struct KqState {
     pub subs_by_path: FxHashMap<String, Vec<KqueueSubscription>>, // multimap<path, sub>
-    pub fd_to_entry: FxHashMap<i32, (EntriesID, String)>,
+    // fd -> (entries map, path, registration token)
+    pub fd_to_entry: FxHashMap<i32, (EntriesID, String, usize)>,
     pub entry_maps: FxHashMap<EntriesID, FxHashMap<String, DirEntry>>,
 }
 
@@ -208,7 +223,8 @@ impl KqueueBackend {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    fn run_loop(&self) -> Result<(), Error> {
+    // The setup half of Go's `start`: the kqueue and the shutdown pipe.
+    pub fn open_kqueue(&self) -> Result<(), Error> {
         // SAFETY: plain syscall.
         let kq = unsafe { libc::kqueue() };
         if kq < 0 {
@@ -235,14 +251,34 @@ impl KqueueBackend {
         if let Err(err) = kevent_register(kq, &pipe_ev) {
             return Err(Error::new(format!("unable to watch pipe: {err}")));
         }
+        Ok(())
+    }
 
+    fn run_loop(&self) -> Result<(), Error> {
+        self.open_kqueue()?;
         self.base.notify_started();
 
         // SAFETY: zeroed kevent structs are valid.
         let mut events: Vec<libc::kevent> = vec![unsafe { std::mem::zeroed() }; 128];
         let mut watchers_touched: Vec<Arc<DirWatch>> = Vec::new();
         loop {
-            // SAFETY: `events` has room for `events.len()` results.
+            let n = self.read_events(&mut events, None)?;
+            if self.handle_events(&events[..n], &mut watchers_touched) {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    // One `kevent` wait (retried on EINTR); `timeout` None blocks.
+    pub fn read_events(
+        &self,
+        events: &mut [libc::kevent],
+        timeout: Option<&libc::timespec>,
+    ) -> Result<usize, Error> {
+        let kq = self.kq.load(Ordering::SeqCst);
+        loop {
+            // SAFETY: `events` has room for `events.len()` results; `timeout` is null or a live timespec.
             let n = unsafe {
                 libc::kevent(
                     kq,
@@ -250,70 +286,78 @@ impl KqueueBackend {
                     0,
                     events.as_mut_ptr(),
                     events.len() as i32,
-                    std::ptr::null(),
+                    timeout.map_or(std::ptr::null(), std::ptr::from_ref),
                 )
             };
-            if n < 0 {
-                let err = std::io::Error::last_os_error();
-                if err.raw_os_error() == Some(libc::EINTR) {
-                    continue;
-                }
+            if n >= 0 {
+                return Ok(n as usize);
+            }
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EINTR) {
                 return Err(Error::new(format!("kevent error: {err}")));
             }
+        }
+    }
 
-            let mut stop = false;
-            for ev in &events[..n as usize] {
-                let mut fflags = ev.fflags;
-                let flags = ev.flags;
-                let fd = ev.ident as i32;
-                if fd == pipe_fds[0] {
-                    stop = true;
-                    break;
-                }
-
-                // EV_ERROR indicates kevent couldn't apply a changelist
-                // entry or that the kernel rejected the registration.
-                if flags & libc::EV_ERROR != 0 {
-                    continue;
-                }
-
-                let st = self.mu.lock().unwrap();
-                let entry = st.fd_to_entry.get(&fd).and_then(|(map, path)| {
-                    st.entry_maps.get(map).and_then(|m| m.get(path)).map(|e| (*map, e.clone()))
-                });
-                drop(st);
-                let Some((map_id, entry)) = entry else {
-                    continue;
-                };
-
-                if fflags & libc::NOTE_WRITE != 0 && entry.is_dir {
-                    self.compare_dir(fd, &entry.path, &mut watchers_touched);
-                    // NOTE_WRITE on a dir already ran compareDir above.
-                    // On DragonFlyBSD, rename-over coalesces NOTE_DELETE
-                    // with NOTE_WRITE on the parent directory (rather than
-                    // firing NOTE_DELETE on the replaced file's fd).
-                    // Skip handleFileEvent so we don't misinterpret the
-                    // coalesced NOTE_DELETE as the directory itself being
-                    // removed.
-                    fflags &= !libc::NOTE_DELETE;
-                }
-                if fflags & !libc::NOTE_WRITE != 0 || !entry.is_dir {
-                    self.handle_file_event(fflags, map_id, &entry.path, &mut watchers_touched);
-                }
-            }
-
-            #[expect(
-                clippy::iter_with_drain,
-                reason = "the vector is reused by the long-running event loop so draining retains its allocation"
-            )]
-            for w in watchers_touched.drain(..) {
-                w.notify();
-            }
-            if stop {
+    // Handles one batch of events and notifies the watches it touched. Returns true when the shutdown pipe fired.
+    pub fn handle_events(
+        &self,
+        events: &[libc::kevent],
+        watchers_touched: &mut Vec<Arc<DirWatch>>,
+    ) -> bool {
+        let pipe_read_fd = self.pipe_read_fd.load(Ordering::SeqCst);
+        let mut stop = false;
+        for ev in events {
+            let mut fflags = ev.fflags;
+            let flags = ev.flags;
+            let fd = ev.ident as i32;
+            if fd == pipe_read_fd {
+                stop = true;
                 break;
             }
+
+            // EV_ERROR indicates kevent couldn't apply a changelist
+            // entry or that the kernel rejected the registration.
+            if flags & libc::EV_ERROR != 0 {
+                continue;
+            }
+
+            let st = self.mu.lock().unwrap();
+            let entry = st.fd_to_entry.get(&fd).and_then(|(map, path, token)| {
+                if *token != ev.udata as usize {
+                    return None;
+                }
+                st.entry_maps
+                    .get(map)
+                    .and_then(|m| m.get(path))
+                    .filter(|e| e.state == Some(fd))
+                    .map(|e| (*map, e.clone()))
+            });
+            drop(st);
+            let Some((map_id, entry)) = entry else {
+                continue;
+            };
+
+            if fflags & libc::NOTE_WRITE != 0 && entry.is_dir {
+                self.compare_dir(fd, &entry.path, watchers_touched);
+                // NOTE_WRITE on a dir already ran compareDir above.
+                // On DragonFlyBSD, rename-over coalesces NOTE_DELETE
+                // with NOTE_WRITE on the parent directory (rather than
+                // firing NOTE_DELETE on the replaced file's fd).
+                // Skip handleFileEvent so we don't misinterpret the
+                // coalesced NOTE_DELETE as the directory itself being
+                // removed.
+                fflags &= !libc::NOTE_DELETE;
+            }
+            if fflags & !libc::NOTE_WRITE != 0 || !entry.is_dir {
+                self.handle_file_event(fflags, map_id, &entry.path, watchers_touched);
+            }
         }
-        Ok(())
+
+        for w in watchers_touched.drain(..) {
+            w.notify();
+        }
+        stop
     }
 
     // kqueue.go:219
@@ -458,19 +502,14 @@ impl KqueueBackend {
             return false;
         };
 
-        let ev = new_kevent(
-            fd,
-            libc::EVFILT_VNODE,
-            libc::EV_ADD | libc::EV_CLEAR | libc::EV_ENABLE,
-            VNODE_FFLAGS,
-        );
-        if kevent_register(self.kq.load(Ordering::SeqCst), &ev).is_err() {
+        let token = self.next_id() as usize;
+        if watch_fd(self.kq.load(Ordering::SeqCst), fd, token).is_err() {
             close_fd(fd);
             return false;
         }
 
         st.set_entry_state(map_id, &entry.path, Some(fd));
-        st.fd_to_entry.insert(fd, (map_id, entry.path.clone()));
+        st.fd_to_entry.insert(fd, (map_id, entry.path.clone(), token));
         true
     }
 
@@ -497,18 +536,13 @@ impl KqueueBackend {
                     return false;
                 }
             };
-            let ev = new_kevent(
-                fd,
-                libc::EVFILT_VNODE,
-                libc::EV_ADD | libc::EV_CLEAR | libc::EV_ENABLE,
-                VNODE_FFLAGS,
-            );
-            if kevent_register(self.kq.load(Ordering::SeqCst), &ev).is_err() {
+            let token = self.next_id() as usize;
+            if watch_fd(self.kq.load(Ordering::SeqCst), fd, token).is_err() {
                 close_fd(fd);
                 return false;
             }
             st.set_entry_state(map_id, path, Some(fd));
-            st.fd_to_entry.insert(fd, (map_id, path.to_string()));
+            st.fd_to_entry.insert(fd, (map_id, path.to_string(), token));
         }
         let sub = KqueueSubscription {
             id: self.next_id(),
@@ -953,13 +987,8 @@ impl WatcherImpl for KqueueBackend {
                     continue;
                 }
             };
-            let ev = new_kevent(
-                fd,
-                libc::EVFILT_VNODE,
-                libc::EV_ADD | libc::EV_CLEAR | libc::EV_ENABLE,
-                VNODE_FFLAGS,
-            );
-            if let Err(err) = kevent_register(kq, &ev) {
+            let token = self.next_id() as usize;
+            if let Err(err) = watch_fd(kq, fd, token) {
                 close_fd(fd);
                 if path == w.dir {
                     st.cleanup_entries_locked(&mut entries);
@@ -969,7 +998,7 @@ impl WatcherImpl for KqueueBackend {
                 continue;
             }
             entries.get_mut(&path).unwrap().state = Some(fd);
-            st.fd_to_entry.insert(fd, (map_id, path));
+            st.fd_to_entry.insert(fd, (map_id, path, token));
         }
 
         #[expect(

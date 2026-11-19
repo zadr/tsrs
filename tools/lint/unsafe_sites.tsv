@@ -417,9 +417,9 @@ crates/tsrs_fswatch/src/inotify_linux.rs	InotifyBackend::run_loop	block	boundary
 crates/tsrs_fswatch/src/inotify_linux.rs	InotifyBackend::shutdown	block	boundary	writing one byte from a live buffer to our own pipe.	keep	OS, FFI or allocator call
 crates/tsrs_fswatch/src/inotify_linux.rs	InotifyBackend::watch_dir	block	boundary	`cpath` is NUL-terminated and outlives the call.	keep	OS, FFI or allocator call
 crates/tsrs_fswatch/src/inotify_linux.rs	close_fd	block	boundary	closing an fd this backend opened.	keep	OS, FFI or allocator call
-crates/tsrs_fswatch/src/kqueue.rs	KqueueBackend::run_loop	block	boundary	`events` has room for `events.len()` results.	keep	OS, FFI or allocator call
-crates/tsrs_fswatch/src/kqueue.rs	KqueueBackend::run_loop	block	boundary	`pipe_fds` has room for two fds.	keep	OS, FFI or allocator call
-crates/tsrs_fswatch/src/kqueue.rs	KqueueBackend::run_loop	block	boundary	plain syscall.	keep	OS, FFI or allocator call
+crates/tsrs_fswatch/src/kqueue.rs	KqueueBackend::open_kqueue	block	boundary	`pipe_fds` has room for two fds.	keep	OS, FFI or allocator call
+crates/tsrs_fswatch/src/kqueue.rs	KqueueBackend::open_kqueue	block	boundary	plain syscall.	keep	OS, FFI or allocator call
+crates/tsrs_fswatch/src/kqueue.rs	KqueueBackend::read_events	block	boundary	`events` has room for `events.len()` results; `timeout` is null or a live timespec.	keep	OS, FFI or allocator call
 crates/tsrs_fswatch/src/kqueue.rs	KqueueBackend::run_loop	block	boundary	zeroed kevent structs are valid.	keep	OS, FFI or allocator call
 crates/tsrs_fswatch/src/kqueue.rs	KqueueBackend::shutdown	block	boundary	writing one byte from a live buffer to our own pipe.	keep	OS, FFI or allocator call
 crates/tsrs_fswatch/src/kqueue.rs	close_fd	block	boundary	closing an fd this backend opened and still tracks.	keep	OS, FFI or allocator call

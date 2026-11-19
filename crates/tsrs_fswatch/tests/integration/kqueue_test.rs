@@ -35,7 +35,7 @@ fn insert_watch(backend: &KqueueBackend, watch: &Arc<DirWatch>, map_id: EntriesI
             },
         )]),
     );
-    st.fd_to_entry.insert(fd, (map_id, path.clone()));
+    st.fd_to_entry.insert(fd, (map_id, path.clone(), 0));
     st.subs_by_path.entry(path.clone()).or_default().push(KqueueSubscription {
         id: backend.next_id(),
         dir_watch: Arc::clone(watch),
@@ -89,7 +89,7 @@ fn closing_watches_owns_only_current_entry_descriptors() {
         {
             let mut st = backend.mu.lock().unwrap();
             st.set_entry_state(1, &watch.dir, Some(replacement));
-            st.fd_to_entry.insert(replacement, (1, watch.dir.clone()));
+            st.fd_to_entry.insert(replacement, (1, watch.dir.clone(), 0));
         }
         if shutdown {
             backend.close_subscriptions();

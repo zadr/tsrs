@@ -6,6 +6,7 @@ mod fsevents_load;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod isolated;
 mod kqueue_macos;
+mod kqueue_sequences;
 #[cfg(target_os = "macos")]
 mod kqueue_test;
 #[cfg(unix)]
