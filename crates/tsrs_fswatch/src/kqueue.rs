@@ -23,11 +23,15 @@
 //
 // Representation: Go's `*dirEntry` values are shared between a subscription's entries map and `fdToEntry`. Here
 // every subscription's entries map lives in `kqState.entry_maps` (keyed by a map id; all subscriptions created by
-// one `subscribe` share the map, as in Go), and `fd_to_entry` maps an fd to (map id, path). `compareDir` holds
+// one `subscribe` share the map, as in Go), and `fd_to_entry` maps an fd to (map id, path). An entries map is a tree
+// (`EntryMap`): each entry holds the set of entries directly under it, so listing or removing a directory's entries
+// costs the size of the directory, where Go ranges the whole map. `compareDir` holds
 // `mu` for its whole run (Go releases it around directory reads and re-acquires it in `watchPath`); only the
 // event-loop thread mutates entry maps after `subscribe`, so this changes blocking, not results.
 
+use hashbrown::HashTable;
 use rustc_hash::FxHashMap;
+use std::hash::BuildHasher;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -169,6 +173,255 @@ pub struct DirEntry {
 
 pub type EntriesID = u64;
 
+type NodeId = u32;
+
+fn hash_str(s: &str) -> u64 {
+    rustc_hash::FxBuildHasher.hash_one(s)
+}
+
+fn name_of(path: &str) -> &str {
+    path.rfind('/').map_or(path, |i| &path[i + 1..])
+}
+
+fn parent_of(path: &str) -> &str {
+    match path.rfind('/') {
+        Some(0) => "/",
+        Some(i) => &path[..i],
+        None => "",
+    }
+}
+
+struct Node {
+    entry: DirEntry,
+    // false: Go removed this path alone (a failed watch) while paths under it stay in its map. The node remains so
+    // that they are still reached when an ancestor is removed, and is revived if the path is added again.
+    present: bool,
+    parent: Option<NodeId>,
+    // The nodes directly under this one, hashed by name.
+    children: HashTable<NodeId>,
+}
+
+// Go's `map[string]*dirEntry` of one subscribe, as a tree of nodes in a slab with an index by path.
+#[derive(Default)]
+pub struct EntryMap {
+    nodes: Vec<Option<Node>>,
+    free: Vec<NodeId>,
+    by_path: HashTable<NodeId>,
+}
+
+impl EntryMap {
+    pub fn with_capacity(n: usize) -> EntryMap {
+        // Room for an eighth more entries, as a hash map of the entries would have: the first entries created
+        // after subscribe do not move the slab.
+        EntryMap {
+            nodes: Vec::with_capacity(n + n / 8),
+            free: Vec::new(),
+            by_path: HashTable::with_capacity(n),
+        }
+    }
+
+    fn node(&self, id: NodeId) -> &Node {
+        self.nodes[id as usize].as_ref().unwrap()
+    }
+
+    fn node_mut(&mut self, id: NodeId) -> &mut Node {
+        self.nodes[id as usize].as_mut().unwrap()
+    }
+
+    // The node at `path`, present or not.
+    fn id(&self, path: &str) -> Option<NodeId> {
+        self.by_path.find(hash_str(path), |&id| self.node(id).entry.path == path).copied()
+    }
+
+    fn present_id(&self, path: &str) -> Option<NodeId> {
+        self.id(path).filter(|&id| self.node(id).present)
+    }
+
+    fn child(&self, dir: NodeId, name: &str) -> Option<NodeId> {
+        self.node(dir)
+            .children
+            .find(hash_str(name), |&id| name_of(&self.node(id).entry.path) == name)
+            .copied()
+    }
+
+    pub fn get(&self, path: &str) -> Option<&DirEntry> {
+        self.present_id(path).map(|id| &self.node(id).entry)
+    }
+
+    pub fn get_mut(&mut self, path: &str) -> Option<&mut DirEntry> {
+        self.present_id(path).map(|id| &mut self.node_mut(id).entry)
+    }
+
+    pub fn contains_key(&self, path: &str) -> bool {
+        self.present_id(path).is_some()
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &DirEntry> {
+        self.nodes.iter().flatten().filter(|n| n.present).map(|n| &n.entry)
+    }
+
+    pub fn into_values(self) -> impl Iterator<Item = DirEntry> {
+        self.nodes.into_iter().flatten().filter(|n| n.present).map(|n| n.entry)
+    }
+
+    // Go `entries[e.path] = e`. Entries under the path stay. A new path's parent is already in the map, except
+    // for the first entry (the watched directory); `children` sizes its set of entries (a directory's listing).
+    pub fn insert(&mut self, entry: DirEntry, children: usize) -> NodeId {
+        if let Some(id) = self.id(&entry.path) {
+            let node = self.node_mut(id);
+            node.entry = entry;
+            node.present = true;
+            return id;
+        }
+        let parent = self.id(parent_of(&entry.path));
+        debug_assert!(
+            parent.is_some() || self.by_path.is_empty(),
+            "{} has no parent entry",
+            entry.path
+        );
+        let hash = hash_str(&entry.path);
+        let node = Node {
+            entry,
+            present: true,
+            parent,
+            children: if children == 0 {
+                HashTable::new()
+            } else {
+                HashTable::with_capacity(children)
+            },
+        };
+        let id = if let Some(id) = self.free.pop() {
+            self.nodes[id as usize] = Some(node);
+            id
+        } else {
+            self.nodes.push(Some(node));
+            (self.nodes.len() - 1) as NodeId
+        };
+        let EntryMap { nodes, by_path, .. } = self;
+        let path_hash = |&id: &NodeId| hash_str(&nodes[id as usize].as_ref().unwrap().entry.path);
+        by_path.insert_unique(hash, id, path_hash);
+        if let Some(parent) = parent {
+            let name_hash = hash_str(name_of(&self.node(id).entry.path));
+            let mut siblings = std::mem::take(&mut self.node_mut(parent).children);
+            siblings.insert_unique(name_hash, id, |&c| hash_str(name_of(&self.node(c).entry.path)));
+            self.node_mut(parent).children = siblings;
+        }
+        id
+    }
+
+    // Go `delete(entries, path)`.
+    pub fn remove(&mut self, path: &str) {
+        let Some(id) = self.present_id(path) else {
+            return;
+        };
+        self.node_mut(id).present = false;
+        self.prune(id);
+    }
+
+    // Frees a node that is not present and has nothing under it, then its parent if that is left the same way.
+    fn prune(&mut self, mut id: NodeId) {
+        loop {
+            let node = self.node(id);
+            if node.present || !node.children.is_empty() {
+                return;
+            }
+            match self.take_node(id).parent {
+                Some(parent) => id = parent,
+                None => return,
+            }
+        }
+    }
+
+    // Unlinks a node from the index and from its parent's children, and frees its slot.
+    fn take_node(&mut self, id: NodeId) -> Node {
+        let node = self.nodes[id as usize].take().unwrap();
+        if let Ok(slot) = self.by_path.find_entry(hash_str(&node.entry.path), |&i| i == id) {
+            slot.remove();
+        }
+        if let Some(parent) = node.parent
+            && let Some(parent) = self.nodes[parent as usize].as_mut()
+            && let Ok(slot) =
+                parent.children.find_entry(hash_str(name_of(&node.entry.path)), |&i| i == id)
+        {
+            slot.remove();
+        }
+        self.free.push(id);
+        node
+    }
+
+    fn reserve_children(&mut self, id: NodeId, additional: usize) {
+        let mut children = std::mem::take(&mut self.node_mut(id).children);
+        children.reserve(additional, |&c| hash_str(name_of(&self.node(c).entry.path)));
+        self.node_mut(id).children = children;
+    }
+
+    // The present entries under `path` (not `path` itself).
+    fn descendants(&self, path: &str) -> Vec<NodeId> {
+        let mut out = Vec::new();
+        if let Some(id) = self.id(path) {
+            let mut stack: Vec<NodeId> = self.node(id).children.iter().copied().collect();
+            while let Some(id) = stack.pop() {
+                let node = self.node(id);
+                stack.extend(node.children.iter().copied());
+                if node.present {
+                    out.push(id);
+                }
+            }
+        }
+        out
+    }
+
+    // Go: delete path (when `include_root`) and every path under it; `removed` gets each removed entry.
+    fn remove_tree(&mut self, path: &str, include_root: bool, mut removed: impl FnMut(DirEntry)) {
+        let Some(root) = self.id(path) else {
+            return;
+        };
+        let mut stack: Vec<NodeId> = self.node_mut(root).children.drain().collect();
+        while let Some(id) = stack.pop() {
+            let node = self.take_node(id);
+            stack.extend(node.children.iter().copied());
+            if node.present {
+                removed(node.entry);
+            }
+        }
+        if include_root {
+            let node = self.take_node(root);
+            if node.present {
+                removed(node.entry);
+            }
+            if let Some(parent) = node.parent {
+                self.prune(parent);
+            }
+        } else {
+            self.prune(root);
+        }
+    }
+
+    fn values_mut(&mut self) -> impl Iterator<Item = &mut DirEntry> {
+        self.nodes.iter_mut().flatten().filter(|n| n.present).map(|n| &mut n.entry)
+    }
+}
+
+// Entry counts under each directory of a pre-order walk, to size the directories' sets of entries.
+fn child_counts(walked: &[(String, bool, u64)]) -> Vec<usize> {
+    let mut counts = vec![0; walked.len()];
+    let mut dirs: Vec<usize> = Vec::new();
+    for (i, (path, is_dir, _)) in walked.iter().enumerate() {
+        let parent = parent_of(path);
+        while let Some(&top) = dirs.last() {
+            if walked[top].0 == parent {
+                counts[top] += 1;
+                break;
+            }
+            dirs.pop();
+        }
+        if *is_dir {
+            dirs.push(i);
+        }
+    }
+    counts
+}
+
 #[derive(Clone)]
 pub struct KqueueSubscription {
     pub id: u64,
@@ -182,7 +435,7 @@ pub struct KqState {
     pub subs_by_path: FxHashMap<String, Vec<KqueueSubscription>>, // multimap<path, sub>
     // fd -> (entries map, path, registration token)
     pub fd_to_entry: FxHashMap<i32, (EntriesID, String, usize)>,
-    pub entry_maps: FxHashMap<EntriesID, FxHashMap<String, DirEntry>>,
+    pub entry_maps: FxHashMap<EntriesID, EntryMap>,
 }
 
 pub struct KqueueBackend {
@@ -446,7 +699,7 @@ impl KqueueBackend {
                         st.close_descendant_fds_locked(&sub.dir_watch, sub.entries, &sub.path);
                     }
                     if let Some(m) = st.entry_maps.get_mut(&sub.entries) {
-                        remove_entry_and_descendants(m, &sub.path);
+                        m.remove_tree(&sub.path, true, drop);
                     }
                     // Root-of-watch deletion: no more events can fire
                     // for this dirWatch. Tell the caller.
@@ -564,11 +817,6 @@ impl KqueueBackend {
     // directory has NOTE_WRITE: list the dir, diff against the tree, emit
     // create/remove events.
     fn compare_dir(&self, _fd: i32, path: &str, touched: &mut Vec<Arc<DirWatch>>) -> bool {
-        struct DiskSnapshot {
-            entries: Vec<DiskEntry>,
-            current_display_paths: rustc_hash::FxHashSet<String>,
-        }
-
         let mut st = self.mu.lock().unwrap();
         let subs = st.find_subscriptions_locked(path);
 
@@ -591,19 +839,21 @@ impl KqueueBackend {
         let subs = filtered_subs;
 
         let dir_start = format!("{path}/");
-        let mut snapshots: FxHashMap<String, Arc<DiskSnapshot>> = FxHashMap::default();
+        // Listings sorted by name, by watch path.
+        let mut snapshots: FxHashMap<String, Arc<Vec<DiskEntry>>> = FxHashMap::default();
 
         // Each subscription has its own entries map (built in subscribe).
         // Multiple subs at the same path arise from multiple dirWatches
         // covering overlapping subtrees; their maps are always distinct, so
         // we iterate subs directly rather than trying to dedup by map identity.
         for sub in &subs {
-            let Some(base_entry) =
-                st.entry_maps.get(&sub.entries).and_then(|m| m.get(path)).cloned()
-            else {
+            let map_id = sub.entries;
+            let Some((dir, watch_path)) = st.entry_maps.get(&map_id).and_then(|m| {
+                let dir = m.present_id(path)?;
+                Some((dir, m.node(dir).entry.watch_path.clone()))
+            }) else {
                 continue;
             };
-            let watch_path = base_entry.watch_path;
             let watch_dir_start = format!("{watch_path}/");
 
             let snapshot = if let Some(s) = snapshots.get(&watch_path) {
@@ -612,28 +862,30 @@ impl KqueueBackend {
                 let Ok(disk_entries) = read_entries(&watch_path) else {
                     continue;
                 };
-                let current_display_paths =
-                    disk_entries.iter().map(|ent| format!("{dir_start}{}", ent.name)).collect();
-                let s = Arc::new(DiskSnapshot { entries: disk_entries, current_display_paths });
+                let s = Arc::new(disk_entries);
                 snapshots.insert(watch_path, Arc::clone(&s));
                 s
             };
 
-            let map_id = sub.entries;
-            for ent in &snapshot.entries {
-                let full_path = format!("{dir_start}{}", ent.name);
-                let full_watch_path = format!("{watch_dir_start}{}", ent.name);
-
-                let existing = st.entry_maps.get(&map_id).and_then(|m| m.get(&full_path)).cloned();
-                if let Some(existing) = existing {
-                    let mut existing_state = existing.state;
-                    if let Some(fd) = existing.state
-                        && replaced(fd, &existing, ent, &full_watch_path)
+            if let Some(m) = st.entry_maps.get_mut(&map_id) {
+                m.reserve_children(dir, snapshot.len().saturating_sub(m.node(dir).children.len()));
+            }
+            for ent in snapshot.iter() {
+                let existing = st.entry_maps.get(&map_id).and_then(|m| {
+                    let node = m.node(m.child(dir, &ent.name)?);
+                    node.present.then_some((node.entry.is_dir, node.entry.state, node.entry.ino))
+                });
+                let full_path = || format!("{dir_start}{}", ent.name);
+                let full_watch_path = || format!("{watch_dir_start}{}", ent.name);
+                if let Some((existing_is_dir, mut existing_state, existing_ino)) = existing {
+                    if let Some(fd) = existing_state
+                        && replaced(fd, existing_ino, ent, &watch_dir_start)
                     {
                         // Inode changed: path was replaced.
+                        let full_path = full_path();
                         st.close_entry_locked(map_id, &full_path);
                         st.remove_subs_for_entries_locked(&full_path, sub.id);
-                        if existing.is_dir {
+                        if existing_is_dir {
                             st.remove_entry_and_descendants_locked(
                                 map_id, &full_path, false, sub.id,
                             );
@@ -651,16 +903,19 @@ impl KqueueBackend {
                     }
                     // Entry exists but fd is stale: the file was replaced.
                     // Re-watch it and emit an update.
+                    let full_path = full_path();
                     if !self.watch_path_locked(&mut st, &sub.dir_watch, &full_path, map_id) {
                         continue;
                     }
                     sub.dir_watch.events.update(&full_path);
                     touch(touched, &sub.dir_watch);
                     if ent.is_dir && sub.dir_watch.recursive {
-                        self.walk_new_subtree_locked(&mut st, sub, map_id, &full_watch_path);
+                        self.walk_new_subtree_locked(&mut st, sub, map_id, &full_watch_path());
                     }
                     continue;
                 }
+                let full_path = full_path();
+                let full_watch_path = full_watch_path();
                 let e = DirEntry {
                     path: full_path.clone(),
                     watch_path: full_watch_path.clone(),
@@ -668,7 +923,7 @@ impl KqueueBackend {
                     state: None,
                     ino: ent.ino,
                 };
-                st.entry_maps.entry(map_id).or_default().insert(full_path.clone(), e);
+                st.entry_maps.entry(map_id).or_default().insert(e, 0);
                 if !self.watch_path_locked(&mut st, &sub.dir_watch, &full_path, map_id) {
                     if let Some(m) = st.entry_maps.get_mut(&map_id) {
                         m.remove(&full_path);
@@ -688,39 +943,32 @@ impl KqueueBackend {
 
             // Detect removals: entries directly under dirStart that no longer
             // exist on disk.
-            let mut to_remove = Vec::new();
-            if let Some(m) = st.entry_maps.get(&map_id) {
-                // stale children are removed from disjoint subtrees and from per-path event entries; Go ranges the map too
-                to_remove.extend(m.keys().filter_map(|p| {
-                    let rest = p.strip_prefix(&dir_start)?;
-                    if rest.contains('/') {
-                        return None;
-                    }
-                    if snapshot.current_display_paths.contains(p) {
-                        return None;
-                    }
-                    Some(p.clone())
-                }));
-            }
+            let to_remove: Vec<String> = st.entry_maps.get(&map_id).map_or_default(|m| {
+                m.node(dir)
+                    .children
+                    .iter()
+                    .map(|&id| m.node(id))
+                    .filter(|node| {
+                        node.present
+                            && snapshot
+                                .binary_search_by(|e| (*e.name).cmp(name_of(&node.entry.path)))
+                                .is_err()
+                    })
+                    .map(|node| node.entry.path.clone())
+                    .collect()
+            });
             for p in to_remove {
                 sub.dir_watch.events.remove(&p);
                 touch(touched, &sub.dir_watch);
-                let descendants: Vec<(String, Option<i32>)> =
-                    st.entry_maps.get(&map_id).map_or_default(|m| {
-                        m.iter()
-                            .filter(|(d, _)| *d == &p || is_descendant(d, &p))
-                            .map(|(d, e)| (d.clone(), e.state))
-                            .collect()
+                let KqState { subs_by_path, fd_to_entry, entry_maps } = &mut *st;
+                if let Some(m) = entry_maps.get_mut(&map_id) {
+                    m.remove_tree(&p, true, |e| {
+                        if let Some(fd) = e.state {
+                            close_fd(fd);
+                            fd_to_entry.remove(&fd);
+                        }
+                        subs_by_path.remove(&e.path);
                     });
-                for (descendant, fd) in descendants {
-                    if let Some(fd) = fd {
-                        close_fd(fd);
-                        st.fd_to_entry.remove(&fd);
-                    }
-                    st.subs_by_path.remove(&descendant);
-                }
-                if let Some(m) = st.entry_maps.get_mut(&map_id) {
-                    remove_entry_and_descendants(m, &p);
                 }
             }
         }
@@ -737,13 +985,19 @@ impl KqueueBackend {
     ) {
         let mut found = Vec::new();
         let _ = walk_dir(full_watch_path, true, &mut |p, p_is_dir, ino| {
-            if p == full_watch_path {
-                return Ok(()); // already handled above
-            }
             found.push((p.to_string(), p_is_dir, ino));
             Ok(())
         });
-        for (p, p_is_dir, ino) in found {
+        let counts = child_counts(&found);
+        let mut found = found.into_iter().zip(counts);
+        // The walk's root is already handled above.
+        if let Some(((root, _, _), count)) = found.next()
+            && let Some(m) = st.entry_maps.get_mut(&map_id)
+            && let Some(id) = m.present_id(&sub.dir_watch.display_path(&root))
+        {
+            m.reserve_children(id, count);
+        }
+        for ((p, p_is_dir, ino), count) in found {
             let display_path = sub.dir_watch.display_path(&p);
             let e = DirEntry {
                 path: display_path.clone(),
@@ -752,7 +1006,7 @@ impl KqueueBackend {
                 state: None,
                 ino,
             };
-            st.entry_maps.entry(map_id).or_default().insert(display_path.clone(), e);
+            st.entry_maps.entry(map_id).or_default().insert(e, count);
             sub.dir_watch.events.create(&display_path);
             self.watch_path_locked(st, &sub.dir_watch, &display_path, map_id);
         }
@@ -765,29 +1019,23 @@ fn touch(touched: &mut Vec<Arc<DirWatch>>, w: &Arc<DirWatch>) {
     }
 }
 
-fn is_descendant(descendant: &str, path: &str) -> bool {
-    descendant.len() > path.len()
-        && descendant.as_bytes()[path.len()] == b'/'
-        && descendant.starts_with(path)
-}
-
-// Whether the listed `ent` is no longer the file `existing` holds open as `fd`.
+// Whether the listed `ent` is no longer the file whose entry holds `fd` and stored `ino`.
 #[cfg(not(target_os = "dragonfly"))]
-fn replaced(_fd: i32, existing: &DirEntry, ent: &DiskEntry, _full_watch_path: &str) -> bool {
+fn replaced(_fd: i32, ino: u64, ent: &DiskEntry, _watch_dir_start: &str) -> bool {
     // tsrs-only: the listing's inode number against the one stored with the entry, without a syscall. Go fstats
     // the fd and lstats the path for every listed entry on every change of the directory (DragonFly's rename-over
     // posts no NOTE_DELETE to the replaced file). Elsewhere the kernel posts NOTE_DELETE or NOTE_RENAME to the
     // descriptor whenever the path stops naming its file, so this only notices a replacement earlier in the batch.
     // A symlink always differed there (its fd is open on the target), so it is re-watched on every change.
-    ent.ino != existing.ino || ent.is_symlink
+    ent.ino != ino || ent.is_symlink
 }
 
 // Check if the fd still refers to the same inode as the path on disk. On DragonFlyBSD, rename-over doesn't fire
 // NOTE_DELETE on the replaced file's fd, leaving a stale entry whose fd points to the old (now unlinked) inode.
 #[cfg(target_os = "dragonfly")]
-fn replaced(fd: i32, _existing: &DirEntry, _ent: &DiskEntry, full_watch_path: &str) -> bool {
+fn replaced(fd: i32, _ino: u64, ent: &DiskEntry, watch_dir_start: &str) -> bool {
     use std::os::unix::fs::MetadataExt;
-    match (fstat(fd), std::fs::symlink_metadata(full_watch_path)) {
+    match (fstat(fd), std::fs::symlink_metadata(format!("{watch_dir_start}{}", ent.name))) {
         (Some(fd_st), Ok(path_st)) => fd_st.0 != path_st.dev() || fd_st.1 != path_st.ino(),
         _ => false,
     }
@@ -818,28 +1066,18 @@ impl KqState {
     // the corresponding b.subsByPath / b.fdToEntry bookkeeping, and emits a
     // delete event for each.
     fn close_descendant_fds_locked(&mut self, w: &Arc<DirWatch>, map_id: EntriesID, root: &str) {
-        let prefix = format!("{root}/");
-        let Some(m) = self.entry_maps.get_mut(&map_id) else {
+        let KqState { subs_by_path, fd_to_entry, entry_maps } = self;
+        let Some(m) = entry_maps.get_mut(&map_id) else {
             return;
         };
-        let mut closed = Vec::new();
-        #[expect(
-            clippy::iter_over_hash_type,
-            reason = "each matching entry is closed and removed once; event entries are per path; Go ranges the map too"
-        )]
-        for (path, e) in m.iter_mut() {
-            if !path.starts_with(&prefix) {
-                continue;
-            }
+        for id in m.descendants(root) {
+            let e = &mut m.node_mut(id).entry;
             if let Some(fd) = e.state.take() {
                 close_fd(fd);
-                closed.push(fd);
+                fd_to_entry.remove(&fd);
             }
-            w.events.remove(path);
-            self.subs_by_path.remove(path);
-        }
-        for fd in closed {
-            self.fd_to_entry.remove(&fd);
+            w.events.remove(&e.path);
+            subs_by_path.remove(&e.path);
         }
     }
 
@@ -877,18 +1115,16 @@ impl KqState {
         include_root: bool,
         sub_id: u64,
     ) {
-        let paths: Vec<String> = self.entry_maps.get(&map_id).map_or_default(|m| {
-            m.keys()
-                .filter(|d| if *d == path { include_root } else { is_descendant(d, path) })
-                .cloned()
-                .collect()
-        });
-        for descendant in paths {
-            self.close_entry_locked(map_id, &descendant);
-            self.remove_subs_for_entries_locked(&descendant, sub_id);
-            if let Some(m) = self.entry_maps.get_mut(&map_id) {
-                m.remove(&descendant);
+        let mut removed = Vec::new();
+        if let Some(m) = self.entry_maps.get_mut(&map_id) {
+            m.remove_tree(path, include_root, |e| removed.push(e));
+        }
+        for e in removed {
+            if let Some(fd) = e.state {
+                close_fd(fd);
+                self.fd_to_entry.remove(&fd);
             }
+            self.remove_subs_for_entries_locked(&e.path, sub_id);
         }
     }
 
@@ -900,11 +1136,7 @@ impl KqState {
     // kqueue.go:468
     // cleanupEntriesLocked closes fds for all entries that have been opened.
     // Called on subscribe failure to avoid fd leaks. Must be called under b.mu.
-    fn cleanup_entries_locked(&mut self, entries: &mut FxHashMap<String, DirEntry>) {
-        #[expect(
-            clippy::iter_over_hash_type,
-            reason = "closes every opened fd and drops its fd_to_entry key; Go ranges the map too"
-        )]
+    fn cleanup_entries_locked(&mut self, entries: &mut EntryMap) {
         for e in entries.values_mut() {
             if let Some(fd) = e.state.take() {
                 close_fd(fd);
@@ -931,7 +1163,10 @@ fn read_entries(path: &str) -> Result<Vec<DiskEntry>, Error> {
         let ent = ent.map_err(Error::from_io)?;
         let file_type = ent.file_type();
         out.push(DiskEntry {
-            name: ent.file_name().to_string_lossy().into(),
+            name: ent
+                .file_name()
+                .into_string()
+                .map_or_else(|name| name.to_string_lossy().into(), String::into_boxed_str),
             is_dir: file_type.as_ref().is_ok_and(std::fs::FileType::is_dir),
             #[cfg(not(target_os = "dragonfly"))]
             is_symlink: file_type.is_ok_and(|t| t.is_symlink()),
@@ -941,14 +1176,6 @@ fn read_entries(path: &str) -> Result<Vec<DiskEntry>, Error> {
     })?;
     out.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(out)
-}
-
-// kqueue.go:774
-// removeEntryAndDescendants removes path and all paths prefixed with
-// path + separator from the entries map.
-fn remove_entry_and_descendants(entries: &mut FxHashMap<String, DirEntry>, path: &str) {
-    entries.remove(path);
-    entries.retain(|k, _| !is_descendant(k, path));
 }
 
 impl WatcherImpl for KqueueBackend {
@@ -985,28 +1212,35 @@ impl WatcherImpl for KqueueBackend {
     fn subscribe(&self, w: &Arc<DirWatch>) -> Result<(), Error> {
         // Build the entries map without registering any watches or
         // subscriptions, so the event loop never sees a partially built map.
-        let mut entries: FxHashMap<String, DirEntry> = FxHashMap::default();
+        let mut walked = Vec::new();
         walk_dir(&w.physical_dir, w.recursive, &mut |watch_path, is_dir, ino| {
-            let path = w.display_path(watch_path);
-            entries.insert(
-                path.clone(),
-                DirEntry { path, watch_path: watch_path.to_string(), is_dir, state: None, ino },
-            );
+            walked.push((watch_path.to_string(), is_dir, ino));
             Ok(())
         })?;
+        let counts = child_counts(&walked);
+        let mut entries = EntryMap::with_capacity(walked.len());
+        for ((watch_path, is_dir, ino), count) in walked.into_iter().zip(counts) {
+            let path = w.display_path(&watch_path);
+            entries.insert(DirEntry { path, watch_path, is_dir, state: None, ino }, count);
+        }
 
         // Open fds, register kevents, and publish subscriptions under b.mu.
         let mut st = self.mu.lock().unwrap();
         let map_id = self.next_id();
         let kq = self.kq.load(Ordering::SeqCst);
 
-        let paths: Vec<String> = entries.keys().cloned().collect();
-        for path in paths {
-            let watch_path = entries[&path].watch_path.clone();
-            let fd = match open_for_events(&watch_path) {
+        for id in 0..entries.nodes.len() as NodeId {
+            let Some(node) = entries.nodes[id as usize].as_ref().filter(|n| n.present) else {
+                continue;
+            };
+            let e = &node.entry;
+            let is_root = e.path == w.dir;
+            let opened = open_for_events(&e.watch_path);
+            let path = e.path.clone();
+            let fd = match opened {
                 Ok(fd) => fd,
                 Err(err) => {
-                    if path == w.dir {
+                    if is_root {
                         st.cleanup_entries_locked(&mut entries);
                         return Err(Error::wrap(
                             format!("error watching {}: {}", w.dir, err),
@@ -1014,6 +1248,7 @@ impl WatcherImpl for KqueueBackend {
                         ));
                     }
                     if is_out_of_descriptors(&err) {
+                        let watch_path = entries.node(id).entry.watch_path.clone();
                         st.cleanup_entries_locked(&mut entries);
                         return Err(err_out_of_descriptors(&watch_path, &err));
                     }
@@ -1024,29 +1259,25 @@ impl WatcherImpl for KqueueBackend {
             let token = self.next_id() as usize;
             if let Err(err) = watch_fd(kq, fd, token) {
                 close_fd(fd);
-                if path == w.dir {
+                if is_root {
                     st.cleanup_entries_locked(&mut entries);
                     return Err(Error::wrap(format!("error watching {}: {}", w.dir, err), &err));
                 }
                 entries.remove(&path);
                 continue;
             }
-            entries.get_mut(&path).unwrap().state = Some(fd);
+            entries.node_mut(id).entry.state = Some(fd);
             st.fd_to_entry.insert(fd, (map_id, path, token));
         }
 
-        #[expect(
-            clippy::iter_over_hash_type,
-            reason = "one subscription per distinct path; subscription ids are only compared for equality; Go ranges the map too"
-        )]
-        for path in entries.keys() {
+        for e in entries.values() {
             let sub = KqueueSubscription {
                 id: self.next_id(),
                 dir_watch: Arc::clone(w),
-                path: path.clone(),
+                path: e.path.clone(),
                 entries: map_id,
             };
-            st.subs_by_path.entry(path.clone()).or_default().push(sub);
+            st.subs_by_path.entry(e.path.clone()).or_default().push(sub);
         }
         st.entry_maps.insert(map_id, entries);
         Ok(())

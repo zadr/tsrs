@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use tsrs_fswatch::debounce::Debounce;
 use tsrs_fswatch::kqueue::{
-    DirEntry, EntriesID, KqueueBackend, KqueueSubscription, new_kqueue_backend,
+    DirEntry, EntriesID, EntryMap, KqueueBackend, KqueueSubscription, new_kqueue_backend,
 };
 use tsrs_fswatch::pathcompare::BytePathComparer;
 use tsrs_fswatch::watcher::{DirWatch, WatcherImpl};
@@ -23,19 +23,18 @@ fn insert_watch(backend: &KqueueBackend, watch: &Arc<DirWatch>, map_id: EntriesI
     let fd = open_fd();
     let path = watch.dir.clone();
     let mut st = backend.mu.lock().unwrap();
-    st.entry_maps.insert(
-        map_id,
-        rustc_hash::FxHashMap::from_iter([(
-            path.clone(),
-            DirEntry {
-                path: path.clone(),
-                watch_path: path.clone(),
-                is_dir: false,
-                state: Some(fd),
-                ino: 0,
-            },
-        )]),
+    let mut entries = EntryMap::default();
+    entries.insert(
+        DirEntry {
+            path: path.clone(),
+            watch_path: path.clone(),
+            is_dir: false,
+            state: Some(fd),
+            ino: 0,
+        },
+        0,
     );
+    st.entry_maps.insert(map_id, entries);
     st.fd_to_entry.insert(fd, (map_id, path.clone(), 0));
     st.subs_by_path.entry(path.clone()).or_default().push(KqueueSubscription {
         id: backend.next_id(),

@@ -87,7 +87,6 @@ impl Kq {
         let mut fds = Vec::new();
         #[expect(clippy::iter_over_hash_type, reason = "collected into a set")]
         for m in st.entry_maps.values() {
-            #[expect(clippy::iter_over_hash_type, reason = "collected into a set")]
             for e in m.values() {
                 if e.is_dir
                     && let Some(fd) = e.state
