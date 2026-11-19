@@ -2,10 +2,12 @@
 // uses `std::fs::read_dir`, which is readdir(3) over the same directory stream: the same order, and
 // `DirEntry::file_type` is d_type with an lstat fallback for DT_UNKNOWN (Go's `ent.typ == DT_UNKNOWN` branch).
 // Symlinks are never followed (a symlinked directory is reported as a non-directory, like DT_LNK in Go).
+// tsrs-only: the callback also gets each entry's inode number from its directory listing (the root's from lstat).
 // walkdir.go's `walkDirGeneric` (the Windows / other-OS implementation) is not ported.
 
 use std::fs;
 use std::io::ErrorKind;
+use std::os::unix::fs::{DirEntryExt, MetadataExt};
 
 use crate::watcher::Error;
 
@@ -14,7 +16,7 @@ use crate::watcher::Error;
 pub fn walk_dir(
     dir: &str,
     recursive: bool,
-    f: &mut dyn FnMut(&str, bool) -> Result<(), Error>,
+    f: &mut dyn FnMut(&str, bool, u64) -> Result<(), Error>,
 ) -> Result<(), Error> {
     let md = fs::symlink_metadata(dir).map_err(Error::from_io)?;
     if md.file_type().is_symlink() {
@@ -25,7 +27,7 @@ pub fn walk_dir(
         return Err(Error::from_errno(libc::ENOTDIR));
     }
     let rd = fs::read_dir(dir).map_err(Error::from_io)?;
-    iterate_dir(rd, dir, recursive, f)
+    iterate_dir(rd, dir, md.ino(), recursive, f)
 }
 
 // walkdir_unix.go:44
@@ -34,10 +36,11 @@ pub fn walk_dir(
 fn iterate_dir(
     rd: fs::ReadDir,
     dirname: &str,
+    ino: u64,
     recursive: bool,
-    f: &mut dyn FnMut(&str, bool) -> Result<(), Error>,
+    f: &mut dyn FnMut(&str, bool, u64) -> Result<(), Error>,
 ) -> Result<(), Error> {
-    f(dirname, true)?;
+    f(dirname, true, ino)?;
     let mut entries = Vec::new();
     entries = rd.into_iter().try_fold(entries, |mut entries, ent| {
         let ent = ent.map_err(Error::from_io)?;
@@ -47,18 +50,18 @@ fn iterate_dir(
             // Go: lstat failed for a DT_UNKNOWN entry -> skip it.
             Err(_) => return Ok(entries),
         };
-        entries.push((name, is_dir));
+        entries.push((name, is_dir, ent.ino()));
         Ok::<_, Error>(entries)
     })?;
 
-    for (name, is_dir) in entries {
+    for (name, is_dir, ino) in entries {
         let full_path = format!("{dirname}/{name}");
         if !is_dir {
-            f(&full_path, false)?;
+            f(&full_path, false, ino)?;
             continue;
         }
         if !recursive {
-            f(&full_path, true)?;
+            f(&full_path, true, ino)?;
             continue;
         }
         let child = match fs::read_dir(&full_path) {
@@ -72,7 +75,7 @@ fn iterate_dir(
                 return Err(Error::from_io(err));
             }
         };
-        iterate_dir(child, &full_path, recursive, f)?;
+        iterate_dir(child, &full_path, ino, recursive, f)?;
     }
     Ok(())
 }

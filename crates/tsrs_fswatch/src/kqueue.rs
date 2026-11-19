@@ -163,6 +163,8 @@ pub struct DirEntry {
     pub watch_path: String,
     pub is_dir: bool,
     pub state: Option<i32>, // stores the open fd
+    // tsrs-only: the inode number the parent's listing gave for the path (lstat's after a re-watch).
+    pub ino: u64,
 }
 
 pub type EntriesID = u64;
@@ -508,7 +510,10 @@ impl KqueueBackend {
             return false;
         }
 
-        st.set_entry_state(map_id, &entry.path, Some(fd));
+        if let Some(e) = st.entry_maps.get_mut(&map_id).and_then(|m| m.get_mut(&entry.path)) {
+            e.state = Some(fd);
+            e.ino = std::os::unix::fs::MetadataExt::ino(&md);
+        }
         st.fd_to_entry.insert(fd, (map_id, entry.path.clone(), token));
         true
     }
@@ -560,7 +565,7 @@ impl KqueueBackend {
     // create/remove events.
     fn compare_dir(&self, _fd: i32, path: &str, touched: &mut Vec<Arc<DirWatch>>) -> bool {
         struct DiskSnapshot {
-            entries: Vec<(String, bool)>,
+            entries: Vec<DiskEntry>,
             current_display_paths: rustc_hash::FxHashSet<String>,
         }
 
@@ -608,49 +613,38 @@ impl KqueueBackend {
                     continue;
                 };
                 let current_display_paths =
-                    disk_entries.iter().map(|(name, _)| format!("{dir_start}{name}")).collect();
+                    disk_entries.iter().map(|ent| format!("{dir_start}{}", ent.name)).collect();
                 let s = Arc::new(DiskSnapshot { entries: disk_entries, current_display_paths });
                 snapshots.insert(watch_path, Arc::clone(&s));
                 s
             };
 
             let map_id = sub.entries;
-            for (name, ent_is_dir) in &snapshot.entries {
-                let full_path = format!("{dir_start}{name}");
-                let full_watch_path = format!("{watch_dir_start}{name}");
+            for ent in &snapshot.entries {
+                let full_path = format!("{dir_start}{}", ent.name);
+                let full_watch_path = format!("{watch_dir_start}{}", ent.name);
 
                 let existing = st.entry_maps.get(&map_id).and_then(|m| m.get(&full_path)).cloned();
                 if let Some(existing) = existing {
                     let mut existing_state = existing.state;
-                    if let Some(fd) = existing.state {
-                        // Check if the fd still refers to the same inode as
-                        // the path on disk. On DragonFlyBSD, rename-over
-                        // doesn't fire NOTE_DELETE on the replaced file's fd,
-                        // leaving a stale entry whose fd points to the old
-                        // (now unlinked) inode.
-                        if let (Some(fd_st), Ok(path_st)) =
-                            (fstat(fd), std::fs::symlink_metadata(&full_watch_path))
-                        {
-                            use std::os::unix::fs::MetadataExt;
-                            if fd_st.0 != path_st.dev() || fd_st.1 != path_st.ino() {
-                                // Inode changed: path was replaced.
-                                st.close_entry_locked(map_id, &full_path);
-                                st.remove_subs_for_entries_locked(&full_path, sub.id);
-                                if existing.is_dir {
-                                    st.remove_entry_and_descendants_locked(
-                                        map_id, &full_path, false, sub.id,
-                                    );
-                                }
-                                if let Some(e) = st
-                                    .entry_maps
-                                    .get_mut(&map_id)
-                                    .and_then(|m| m.get_mut(&full_path))
-                                {
-                                    e.is_dir = *ent_is_dir;
-                                }
-                                existing_state = None;
-                            }
+                    if let Some(fd) = existing.state
+                        && replaced(fd, &existing, ent, &full_watch_path)
+                    {
+                        // Inode changed: path was replaced.
+                        st.close_entry_locked(map_id, &full_path);
+                        st.remove_subs_for_entries_locked(&full_path, sub.id);
+                        if existing.is_dir {
+                            st.remove_entry_and_descendants_locked(
+                                map_id, &full_path, false, sub.id,
+                            );
                         }
+                        if let Some(e) =
+                            st.entry_maps.get_mut(&map_id).and_then(|m| m.get_mut(&full_path))
+                        {
+                            e.is_dir = ent.is_dir;
+                            e.ino = ent.ino;
+                        }
+                        existing_state = None;
                     }
                     if existing_state.is_some() {
                         continue;
@@ -662,7 +656,7 @@ impl KqueueBackend {
                     }
                     sub.dir_watch.events.update(&full_path);
                     touch(touched, &sub.dir_watch);
-                    if *ent_is_dir && sub.dir_watch.recursive {
+                    if ent.is_dir && sub.dir_watch.recursive {
                         self.walk_new_subtree_locked(&mut st, sub, map_id, &full_watch_path);
                     }
                     continue;
@@ -670,8 +664,9 @@ impl KqueueBackend {
                 let e = DirEntry {
                     path: full_path.clone(),
                     watch_path: full_watch_path.clone(),
-                    is_dir: *ent_is_dir,
+                    is_dir: ent.is_dir,
                     state: None,
+                    ino: ent.ino,
                 };
                 st.entry_maps.entry(map_id).or_default().insert(full_path.clone(), e);
                 if !self.watch_path_locked(&mut st, &sub.dir_watch, &full_path, map_id) {
@@ -686,7 +681,7 @@ impl KqueueBackend {
                 // For recursive subscriptions, walk into the new directory
                 // to catch pre-populated subdirectories (e.g. a directory
                 // tree moved into the watched area).
-                if *ent_is_dir && sub.dir_watch.recursive {
+                if ent.is_dir && sub.dir_watch.recursive {
                     self.walk_new_subtree_locked(&mut st, sub, map_id, &full_watch_path);
                 }
             }
@@ -741,20 +736,21 @@ impl KqueueBackend {
         full_watch_path: &str,
     ) {
         let mut found = Vec::new();
-        let _ = walk_dir(full_watch_path, true, &mut |p, p_is_dir| {
+        let _ = walk_dir(full_watch_path, true, &mut |p, p_is_dir, ino| {
             if p == full_watch_path {
                 return Ok(()); // already handled above
             }
-            found.push((p.to_string(), p_is_dir));
+            found.push((p.to_string(), p_is_dir, ino));
             Ok(())
         });
-        for (p, p_is_dir) in found {
+        for (p, p_is_dir, ino) in found {
             let display_path = sub.dir_watch.display_path(&p);
             let e = DirEntry {
                 path: display_path.clone(),
                 watch_path: p,
                 is_dir: p_is_dir,
                 state: None,
+                ino,
             };
             st.entry_maps.entry(map_id).or_default().insert(display_path.clone(), e);
             sub.dir_watch.events.create(&display_path);
@@ -775,7 +771,30 @@ fn is_descendant(descendant: &str, path: &str) -> bool {
         && descendant.starts_with(path)
 }
 
+// Whether the listed `ent` is no longer the file `existing` holds open as `fd`.
+#[cfg(not(target_os = "dragonfly"))]
+fn replaced(_fd: i32, existing: &DirEntry, ent: &DiskEntry, _full_watch_path: &str) -> bool {
+    // tsrs-only: the listing's inode number against the one stored with the entry, without a syscall. Go fstats
+    // the fd and lstats the path for every listed entry on every change of the directory (DragonFly's rename-over
+    // posts no NOTE_DELETE to the replaced file). Elsewhere the kernel posts NOTE_DELETE or NOTE_RENAME to the
+    // descriptor whenever the path stops naming its file, so this only notices a replacement earlier in the batch.
+    // A symlink always differed there (its fd is open on the target), so it is re-watched on every change.
+    ent.ino != existing.ino || ent.is_symlink
+}
+
+// Check if the fd still refers to the same inode as the path on disk. On DragonFlyBSD, rename-over doesn't fire
+// NOTE_DELETE on the replaced file's fd, leaving a stale entry whose fd points to the old (now unlinked) inode.
+#[cfg(target_os = "dragonfly")]
+fn replaced(fd: i32, _existing: &DirEntry, _ent: &DiskEntry, full_watch_path: &str) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (fstat(fd), std::fs::symlink_metadata(full_watch_path)) {
+        (Some(fd_st), Ok(path_st)) => fd_st.0 != path_st.dev() || fd_st.1 != path_st.ino(),
+        _ => false,
+    }
+}
+
 // (dev, ino) of an open fd (Go `unix.Fstat`).
+#[cfg(target_os = "dragonfly")]
 fn fstat(fd: i32) -> Option<(u64, u64)> {
     // SAFETY: zeroed `stat` is a valid out-parameter; `fd` is an fd this backend owns.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
@@ -895,17 +914,32 @@ impl KqState {
     }
 }
 
+struct DiskEntry {
+    name: Box<str>,
+    is_dir: bool,
+    #[cfg(not(target_os = "dragonfly"))]
+    is_symlink: bool,
+    ino: u64,
+}
+
 // kqueue.go:732
 // readEntries lists directory entries (excluding "." and "..") at path. (Go `os.ReadDir` sorts by name.)
-fn read_entries(path: &str) -> Result<Vec<(String, bool)>, Error> {
+fn read_entries(path: &str) -> Result<Vec<DiskEntry>, Error> {
+    use std::os::unix::fs::DirEntryExt;
     let mut out = Vec::new();
     out = (std::fs::read_dir(path).map_err(Error::from_io)?).try_fold(out, |mut out, ent| {
         let ent = ent.map_err(Error::from_io)?;
-        let is_dir = ent.file_type().is_ok_and(|t| t.is_dir());
-        out.push((ent.file_name().to_string_lossy().into_owned(), is_dir));
+        let file_type = ent.file_type();
+        out.push(DiskEntry {
+            name: ent.file_name().to_string_lossy().into(),
+            is_dir: file_type.as_ref().is_ok_and(std::fs::FileType::is_dir),
+            #[cfg(not(target_os = "dragonfly"))]
+            is_symlink: file_type.is_ok_and(|t| t.is_symlink()),
+            ino: ent.ino(),
+        });
         Ok::<_, Error>(out)
     })?;
-    out.sort();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(out)
 }
 
@@ -952,11 +986,11 @@ impl WatcherImpl for KqueueBackend {
         // Build the entries map without registering any watches or
         // subscriptions, so the event loop never sees a partially built map.
         let mut entries: FxHashMap<String, DirEntry> = FxHashMap::default();
-        walk_dir(&w.physical_dir, w.recursive, &mut |watch_path, is_dir| {
+        walk_dir(&w.physical_dir, w.recursive, &mut |watch_path, is_dir, ino| {
             let path = w.display_path(watch_path);
             entries.insert(
                 path.clone(),
-                DirEntry { path, watch_path: watch_path.to_string(), is_dir, state: None },
+                DirEntry { path, watch_path: watch_path.to_string(), is_dir, state: None, ino },
             );
             Ok(())
         })?;

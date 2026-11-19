@@ -32,6 +32,7 @@ fn insert_watch(backend: &KqueueBackend, watch: &Arc<DirWatch>, map_id: EntriesI
                 watch_path: path.clone(),
                 is_dir: false,
                 state: Some(fd),
+                ino: 0,
             },
         )]),
     );

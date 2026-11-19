@@ -283,7 +283,7 @@ impl InotifyBackend {
             }
             if is_dir && w.recursive {
                 let mut dirs = Vec::new();
-                let _ = walk_dir(&watch_path, true, &mut |p, p_is_dir| {
+                let _ = walk_dir(&watch_path, true, &mut |p, p_is_dir, _| {
                     if p_is_dir {
                         dirs.push(p.to_string());
                     }
@@ -395,7 +395,7 @@ impl WatcherImpl for InotifyBackend {
             }
             return Ok(());
         }
-        let result = walk_dir(&w.physical_dir, true, &mut |watch_path, is_dir| {
+        let result = walk_dir(&w.physical_dir, true, &mut |watch_path, is_dir, _| {
             if !is_dir {
                 return Ok(());
             }
